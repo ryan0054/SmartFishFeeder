@@ -33,6 +33,25 @@ class ProphetFeedingModel:
         # Load model if available
         self.load_model()
 
+        # After loading, prune to prevent performance issues
+        self.prune_feeding_history(max_entries=100)
+
+        self._cache = {
+            'feeding_history': None,
+            'missed_feedings': None,
+            'satiated_ranges': None,
+            'daily_forecast': None,
+            'forecast_plot': None
+        }
+        self._cache_timestamps = {k: 0 for k in self._cache.keys()}
+        self._cache_lifetimes = {
+            'feeding_history': 60,  # 1 minute
+            'missed_feedings': 60,  # 1 minute
+            'satiated_ranges': 300,  # 5 minutes
+            'daily_forecast': 300,  # 5 minutes
+            'forecast_plot': 600  # 10 minutes
+        }
+
     def load_model(self):
         """Load model from disk if available with missed feedings"""
         if os.path.exists(self.model_file):
@@ -82,6 +101,8 @@ class ProphetFeedingModel:
 
     def save_model(self):
         """Save model to disk including missed feedings"""
+        # Prune before saving to keep file size manageable
+        self.prune_feeding_history(max_entries=100)
         try:
             # Make sure missed_feedings exists
             if not hasattr(self, 'missed_feedings'):
@@ -152,9 +173,14 @@ class ProphetFeedingModel:
             'hunger_score': features['hunger_score']
         })
 
+        self._cache['feeding_history'] = None
+        self._cache['satiated_ranges'] = None
+        self._cache['daily_forecast'] = None
+        self._cache['forecast_plot'] = None
+
         # Train model if we have enough data
         if len(self.feeding_history) >= self.MIN_SAMPLES_FOR_TRAINING:
-            self.train_model()
+            self.train_prophet_model()
 
         # Save updated model
         self.save_model()
@@ -212,7 +238,7 @@ class ProphetFeedingModel:
         return list(self.current_window_timestamps), list(self.current_window_speeds), list(
             self.current_window_variances)
 
-    def train_model(self):
+    def train_prophet_model(self):
         """Train the Prophet time series model"""
         if len(self.feeding_history) < self.MIN_SAMPLES_FOR_TRAINING:
             print(
@@ -241,8 +267,10 @@ class ProphetFeedingModel:
             model = Prophet(
                 daily_seasonality=True,
                 weekly_seasonality=True,
-                changepoint_prior_scale=0.1,  # Slightly more flexible
-                seasonality_mode='multiplicative'  # Fish activity multiplies, not adds
+                changepoint_prior_scale=0.5,  # Increase this from 0.1 to 0.5
+                seasonality_mode='multiplicative',
+                uncertainty_samples=2000,  # Add this parameter - default is 1000
+                interval_width=0.95  # Add this parameter - default is 0.8
             )
 
             # Add regressors
@@ -259,6 +287,10 @@ class ProphetFeedingModel:
 
             # Create and save a forecast visualization for debugging/validation
             self._create_forecast_visualization()
+
+            if self.trained:
+                self._cache['daily_forecast'] = None
+                self._cache['forecast_plot'] = None
 
             return True
 
@@ -289,7 +321,7 @@ class ProphetFeedingModel:
             # Create figure
             fig = plt.figure(figsize=(12, 8))
 
-            # Plot the forecast
+            # Plot the forecast on first subplot
             ax1 = fig.add_subplot(211)
             ax1.plot(forecast['ds'], forecast['yhat'], label='Prediction')
             ax1.fill_between(forecast['ds'], forecast['yhat_lower'], forecast['yhat_upper'],
@@ -304,15 +336,17 @@ class ProphetFeedingModel:
             ax1.set_ylabel('Hunger Score')
             ax1.legend()
 
-            # Plot components
-            ax2 = fig.add_subplot(212)
-            self.prophet_model.plot_components(forecast, ax=ax2)
-
+            # For components, we need to create a new figure since plot_components doesn't support ax parameter
+            # Save the original figure
             plt.tight_layout()
-
-            # Save the figure
             plt.savefig(os.path.join("fish_data", "prophet_forecast.png"))
             plt.close(fig)
+
+            # Create a separate figure for components
+            self.prophet_model.plot_components(forecast)
+            plt.tight_layout()
+            plt.savefig(os.path.join("fish_data", "prophet_components.png"))
+            plt.close()
 
             print("Saved Prophet forecast visualization")
 
@@ -347,7 +381,8 @@ class ProphetFeedingModel:
                 # Create a dataframe for prediction
                 future = pd.DataFrame([{
                     'ds': current_time,
-                    'hour': current_time.hour
+                    'hour': current_time.hour,
+                    'missed': 0  # Add this line - 0 means not a missed feeding
                 }])
 
                 # Make prediction
@@ -404,7 +439,7 @@ class ProphetFeedingModel:
                 hunger_detected = feed_score >= 0.5
 
                 print(f"Feed decision: Prophet={prophet_feed_signal}, Behavior={behavior_feed_signal}, " +
-                      f"Time={time_feed_signal}, Score={feed_score:.2f}, Decision={'Feed' if hunger_detected else 'Don\'t Feed'}")
+                      f"Time={time_feed_signal}, Score={feed_score:.2f}, Decision={'Feed' if hunger_detected else 'Dont Feed'}")
 
                 return hunger_detected
 
@@ -428,7 +463,7 @@ class ProphetFeedingModel:
 
                 print(f"Behavior-based decision: Speed ratio={speed_above_satiated:.2f}, " +
                       f"Variance ratio={var_above_satiated:.2f}, Hours since feed={hours_since_last_feed:.1f}, " +
-                      f"Decision={'Feed' if hunger_detected else 'Don\'t Feed'}")
+                      f"Decision={'Feed' if hunger_detected else 'Dont Feed'}")
 
                 if not self.trained and hours_since_last_feed >= 4.0:
                     if not hunger_detected:
@@ -444,29 +479,33 @@ class ProphetFeedingModel:
             return False  # Default to not feeding on error
 
     def get_satiated_ranges(self):
-        """Get the expected ranges for satiated fish behavior"""
-        if not self.feeding_history:
-            return (0, 0.5), (0, 0.1)  # Default ranges
+        """Get cached satiated ranges"""
 
-        # Extract post-feeding speeds and variances
-        post_speeds = [feed['features']['post_speed_mean'] for feed in self.feeding_history
-                       if 'features' in feed and feed['features']['post_speed_mean'] > 0]
-        post_vars = [feed['features']['post_var_mean'] for feed in self.feeding_history
-                     if 'features' in feed and feed['features']['post_var_mean'] > 0]
+        def calculate_ranges():
+            if not hasattr(self, 'feeding_history') or not self.feeding_history:
+                return (0, 0.5), (0, 0.1)  # Default ranges
 
-        if not post_speeds or not post_vars:
-            return (0, 0.5), (0, 0.1)  # Default ranges
+            # Extract post-feeding speeds and variances
+            post_speeds = [feed['features']['post_speed_mean'] for feed in self.feeding_history
+                           if 'features' in feed and feed['features']['post_speed_mean'] > 0]
+            post_vars = [feed['features']['post_var_mean'] for feed in self.feeding_history
+                         if 'features' in feed and feed['features']['post_var_mean'] > 0]
 
-        # Calculate range with some buffer
-        speed_mean = np.mean(post_speeds)
-        speed_std = np.std(post_speeds) if len(post_speeds) > 1 else 0.1 * speed_mean
-        var_mean = np.mean(post_vars)
-        var_std = np.std(post_vars) if len(post_vars) > 1 else 0.1 * var_mean
+            if not post_speeds or not post_vars:
+                return (0, 0.5), (0, 0.1)  # Default ranges
 
-        speed_range = (max(0, speed_mean - speed_std), speed_mean + speed_std)
-        var_range = (max(0, var_mean - var_std), var_mean + var_std)
+            # Calculate range with some buffer
+            speed_mean = np.mean(post_speeds)
+            speed_std = np.std(post_speeds) if len(post_speeds) > 1 else 0.1 * speed_mean
+            var_mean = np.mean(post_vars)
+            var_std = np.std(post_vars) if len(post_vars) > 1 else 0.1 * var_mean
 
-        return speed_range, var_range
+            speed_range = (max(0, speed_mean - speed_std), speed_mean + speed_std)
+            var_range = (max(0, var_mean - var_std), var_mean + var_std)
+
+            return speed_range, var_range
+
+        return self._get_cached('satiated_ranges', calculate_ranges)
 
     def add_missed_feeding(self, timestamp, pre_speeds, pre_variances):
         """Record a missed feeding (user unavailable) as valid hunger data with persistence"""
@@ -500,6 +539,10 @@ class ProphetFeedingModel:
             'pre_variances': pre_variances.copy() if isinstance(pre_variances, list) else list(pre_variances),
             'hunger_score': hunger_score
         })
+
+        self._cache['missed_feedings'] = None
+        self._cache['daily_forecast'] = None
+        self._cache['forecast_plot'] = None
 
         # Update the hunger patterns database
         self.update_hunger_patterns(features)
@@ -613,7 +656,8 @@ class ProphetFeedingModel:
             # Create a dataframe for prediction
             future = pd.DataFrame([{
                 'ds': target_time,
-                'hour': target_time.hour
+                'hour': target_time.hour,
+                'missed': 0  # Add missed regressor
             }])
 
             # Make prediction
@@ -635,96 +679,137 @@ class ProphetFeedingModel:
             return None
 
     def get_daily_forecast(self):
-        """Get a forecast for the next 24 hours to display feeding recommendations"""
-        if not self.trained or not self.prophet_model:
-            return None
+        """Get cached daily forecast"""
 
-        try:
-            # Create a DataFrame for the next 24 hours
-            now = datetime.datetime.now()
-            start = now.replace(minute=0, second=0, microsecond=0)
-            hours = [start + datetime.timedelta(hours=i) for i in range(24)]
+        def calculate_forecast():
+            if not self.trained or not self.prophet_model:
+                return None
 
-            future = pd.DataFrame([{
-                'ds': hour,
-                'hour': hour.hour
-            } for hour in hours])
+            try:
+                # Create a DataFrame for the next 24 hours
+                now = datetime.datetime.now()
+                start = now.replace(minute=0, second=0, microsecond=0)
+                hours = [start + datetime.timedelta(hours=i) for i in range(24)]
 
-            # Make prediction
-            forecast = self.prophet_model.predict(future)
+                future = pd.DataFrame([{
+                    'ds': hour,
+                    'hour': hour.hour,
+                    'missed': 0  # Add missed regressor
+                } for hour in hours])
 
-            # Format results
-            results = []
-            for i in range(len(forecast)):
-                results.append({
-                    'time': hours[i],
-                    'hour': hours[i].hour,
-                    'hunger_score': forecast.iloc[i]['yhat'],
-                    'lower_bound': forecast.iloc[i]['yhat_lower'],
-                    'upper_bound': forecast.iloc[i]['yhat_upper'],
-                    'recommended': forecast.iloc[i]['yhat'] > 1.3  # Threshold for recommendation
-                })
+                # Make prediction
+                forecast = self.prophet_model.predict(future)
 
-            return results
+                # Debug - print raw forecast values for first few hours
+                print("Raw Prophet forecast (first 3 hours):")
+                print(forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].head(3))
 
-        except Exception as e:
-            print(f"Error in get_daily_forecast: {e}")
-            return None
+                # Format results
+                results = []
+                for i in range(len(forecast)):
+                    # Apply bounds to all values
+                    hunger_score = max(0.1, min(3.0, forecast.iloc[i]['yhat']))
+                    lower_bound = max(0.1, min(3.0, forecast.iloc[i]['yhat_lower']))
+                    upper_bound = max(0.1, min(3.0, forecast.iloc[i]['yhat_upper']))
+
+                    # Ensure upper is actually higher than lower
+                    if upper_bound <= lower_bound:
+                        # If they're equal, add at least a small uncertainty
+                        upper_bound = lower_bound + 0.2
+
+                    # Debug uncertainty value
+                    uncertainty = upper_bound - lower_bound
+                    if i < 5:  # Only log first 5 hours
+                        print(f"Hour {hours[i].hour}: score={hunger_score:.4f}, " +
+                              f"lower={lower_bound:.4f}, upper={upper_bound:.4f}, " +
+                              f"uncertainty={uncertainty:.4f}")
+
+                    results.append({
+                        'time': hours[i],
+                        'hour': hours[i].hour,
+                        'hunger_score': hunger_score,
+                        'lower_bound': lower_bound,
+                        'upper_bound': upper_bound,
+                        'uncertainty': uncertainty,  # Store uncertainty directly
+                        'recommended': hunger_score > 1.3  # Threshold for recommendation
+                    })
+
+                return results
+
+            except Exception as e:
+                print(f"Error in get_daily_forecast: {e}")
+                import traceback
+                traceback.print_exc()
+                return None
+
+        return self._get_cached('daily_forecast', calculate_forecast)
 
     def get_forecast_plot(self):
-        """Generate a Prophet forecast plot for the UI"""
-        if not self.trained or not self.prophet_model:
-            return None
+        """Get cached forecast plot"""
 
-        try:
-            # Create future dataframe for the next 36 hours
-            now = datetime.datetime.now()
-            future = pd.DataFrame([{
-                'ds': now + datetime.timedelta(hours=i),
-                'hour': (now.hour + i) % 24
-            } for i in range(36)])
+        def generate_plot():
+            if not self.trained or not self.prophet_model:
+                return None
 
-            # Make prediction
-            forecast = self.prophet_model.predict(future)
+            try:
+                # Create future dataframe for the next 36 hours
+                now = datetime.datetime.now()
+                future = pd.DataFrame([{
+                    'ds': now + datetime.timedelta(hours=i),
+                    'hour': (now.hour + i) % 24,
+                    'missed': 0  # Include the missed regressor
+                } for i in range(36)])
 
-            # Create a matplotlib figure
-            fig = Figure(figsize=(8, 4), dpi=100)
-            ax = fig.add_subplot(111)
+                # Make prediction
+                forecast = self.prophet_model.predict(future)
 
-            # Plot prediction
-            times = [pd.to_datetime(time) for time in forecast['ds']]
-            ax.plot(times, forecast['yhat'], 'b-', label='Predicted Hunger')
+                # Enforce valid hunger score range (0.1 to 3.0) for visualization
+                forecast['yhat'] = forecast['yhat'].apply(lambda x: max(0.1, min(3.0, x)))
+                forecast['yhat_lower'] = forecast['yhat_lower'].apply(lambda x: max(0.1, x))
+                forecast['yhat_upper'] = forecast['yhat_upper'].apply(lambda x: min(3.0, x))
 
-            # Plot uncertainty
-            ax.fill_between(times, forecast['yhat_lower'], forecast['yhat_upper'],
-                            color='blue', alpha=0.2, label='Uncertainty')
+                # Create a matplotlib figure
+                fig = Figure(figsize=(8, 4), dpi=100)
+                ax = fig.add_subplot(111)
 
-            # Add threshold line for feeding
-            ax.axhline(y=1.3, color='r', linestyle='--', label='Feeding Threshold')
+                # Plot prediction
+                times = [pd.to_datetime(time) for time in forecast['ds']]
+                ax.plot(times, forecast['yhat'], 'b-', label='Predicted Hunger')
 
-            # Format x-axis to show hours
-            ax.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+                # Plot uncertainty
+                ax.fill_between(times, forecast['yhat_lower'], forecast['yhat_upper'],
+                                color='blue', alpha=0.2, label='Uncertainty')
 
-            # Add labels
-            ax.set_xlabel('Time')
-            ax.set_ylabel('Hunger Score')
-            ax.set_title('Forecasted Fish Hunger')
-            ax.legend()
+                # Add threshold line for feeding
+                ax.axhline(y=1.3, color='r', linestyle='--', label='Feeding Threshold')
 
-            # Rotate x labels
-            for label in ax.get_xticklabels():
-                label.set_rotation(45)
-                label.set_ha('right')
+                # Set y-axis limits to enforce valid range and prevent negative values
+                ax.set_ylim(bottom=0, top=3.5)  # Show full range with a bit of padding
 
-            fig.tight_layout()
+                # Format x-axis to show hours
+                ax.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
 
-            return fig
+                # Add labels
+                ax.set_xlabel('Time')
+                ax.set_ylabel('Hunger Score')
+                ax.set_title('Forecasted Fish Hunger')
+                ax.legend()
 
-        except Exception as e:
-            print(f"Error generating forecast plot: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+                # Rotate x labels
+                for label in ax.get_xticklabels():
+                    label.set_rotation(45)
+                    label.set_ha('right')
+
+                fig.tight_layout()
+                return fig
+
+            except Exception as e:
+                print(f"Error generating forecast plot: {e}")
+                import traceback
+                traceback.print_exc()
+                return None
+
+        return self._get_cached('forecast_plot', generate_plot)
 
     def analyze_hunger_from_missed_feedings(self):
         """Analyze hunger patterns from missed feedings"""
@@ -744,3 +829,102 @@ class ProphetFeedingModel:
         # If we have enough missed feedings, incorporate them into the model
         if len(self.missed_feedings) >= 3:
             self.incorporate_missed_feedings()
+
+    def force_complete_retrain(self):
+        print("===== PROPHET DIAGNOSIS =====")
+        print(f"Regular feedings: {len(self.feeding_model.feeding_history)}")
+        print(f"Missed feedings: {len(self.feeding_model.missed_feedings)}")
+
+        # Force incorporate missed feedings
+        self.feeding_model.incorporate_missed_feedings()
+
+        # Train with complete data
+        success = self.feeding_model.train_prophet_model(force=True)
+        print(f"Training result: {success}")
+
+        # Check forecast
+        forecast = self.feeding_model.get_daily_forecast()
+        if forecast:
+            print(f"Forecast available with {len(forecast)} entries")
+            print(f"First forecast entry: {forecast[0]}")
+        else:
+            print("No forecast available after training")
+
+        # Force save
+        self.feeding_model.save_model()
+        print("Model saved to disk")
+
+        # Update UI
+        self.update_prophet_forecast()
+
+    def check_prophet_data(self):
+        if not hasattr(self.feeding_model, 'prophet_model') or self.feeding_model.prophet_model is None:
+            print("No Prophet model exists yet")
+            return
+
+        # Check Prophet model internals
+        model = self.feeding_model.prophet_model
+        if hasattr(model, 'history') and model.history is not None:
+            print(f"Prophet model contains {len(model.history)} training points")
+            print(f"First few training points:")
+            print(model.history.head())
+        else:
+            print("Prophet model exists but has no history data")
+
+        # Force a new forecast and print details
+        forecast = self.feeding_model.get_daily_forecast()
+        if forecast:
+            print(f"Generated forecast with {len(forecast)} hours")
+            for i, f in enumerate(forecast[:3]):  # Print first 3 hours
+                print(f"Hour {i}: score={f['hunger_score']:.2f}, recommended={f['recommended']}")
+        else:
+            print("Failed to generate forecast")
+
+    def _get_cached(self, key, generator_func):
+        """Generic caching method with time-based invalidation"""
+        current_time = time.time()
+        lifetime = self._cache_lifetimes.get(key, 60)  # Default 60s
+
+        # Check if cache needs refresh
+        if (self._cache[key] is None or
+                current_time - self._cache_timestamps[key] > lifetime):
+            # Generate fresh data
+            self._cache[key] = generator_func()
+            self._cache_timestamps[key] = current_time
+
+        return self._cache[key]
+
+    def get_feeding_history(self):
+        """Get cached feeding history"""
+        return self._get_cached('feeding_history',
+                                lambda: self.feeding_history.copy() if hasattr(self, 'feeding_history') else [])
+
+    def get_missed_feedings(self):
+        """Get cached missed feedings"""
+        return self._get_cached('missed_feedings',
+                                lambda: self.missed_feedings.copy() if hasattr(self, 'missed_feedings') else [])
+
+    def prune_feeding_history(self, max_entries=100):
+        """Limit the size of feeding history to prevent performance issues"""
+        if hasattr(self, 'feeding_history') and len(self.feeding_history) > max_entries:
+            # Sort by timestamp (newest first)
+            sorted_history = sorted(self.feeding_history,
+                                    key=lambda x: x['timestamp'],
+                                    reverse=True)
+            # Keep only the most recent entries
+            self.feeding_history = sorted_history[:max_entries]
+            print(f"Pruned feeding history to {max_entries} entries")
+
+            # Invalidate cache
+            self._cache['feeding_history'] = None
+
+        # Also prune missed feedings
+        if hasattr(self, 'missed_feedings') and len(self.missed_feedings) > max_entries // 2:
+            sorted_missed = sorted(self.missed_feedings,
+                                   key=lambda x: x['timestamp'],
+                                   reverse=True)
+            self.missed_feedings = sorted_missed[:max_entries // 2]
+            print(f"Pruned missed feedings to {max_entries // 2} entries")
+
+            # Invalidate cache
+            self._cache['missed_feedings'] = None
