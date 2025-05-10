@@ -1,4 +1,4 @@
-import traceback
+import pickle
 import sys
 import os
 import time
@@ -14,27 +14,18 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QDateTime
 import matplotlib
+import pyqtgraph as pg
+
 matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter
+
 plt.ioff()  # Turn off interactive mode
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-
-# Check if ultralytics is installed
-try:
-    from ultralytics import YOLO
-except ImportError:
-    print("Ultralytics not found. Installing...")
-    os.system("pip install ultralytics")
-    from ultralytics import YOLO
-
-# Check if filterpy is installed
-try:
-    from filterpy.kalman import KalmanFilter
-except ImportError:
-    print("FilterPy not found. Installing...")
-    os.system("pip install filterpy")
-    from filterpy.kalman import KalmanFilter
+from ultralytics import YOLO
+from filterpy.kalman import KalmanFilter
+import traceback  # Add explicit import for traceback module
 
 # Constants
 MAX_FEEDING_mode_DURATION = 600  # 10 minutes maximum for any feeding mode
@@ -43,7 +34,7 @@ MAX_FEEDING_DURATION = 600  # 10 minutes
 MAX_TRAJECTORY_LEN = 30  # Number of frames to keep for trajectory lines
 SPEED_HISTORY_LEN = 600  # Number of readings to keep for graphs
 MONITORING_WINDOW = 300  # 5 minutes (300 seconds) monitoring window
-FEED_DECISION_INTERVAL = 60  # Check for feeding every 60s
+FEED_DECISION_INTERVAL = 300  # Check for feeding every 60s
 MIN_FEED_INTERVAL = 7200  # Minimum seconds between feedings (2 hours)
 INITIAL_FEED_DELAY = 300  # Seconds before first feeding analysis (15 minutes)
 PRE_FEEDING_DURATION = 300  # 5 minutes pre-feeding analysis
@@ -53,27 +44,66 @@ DAILY_OPERATION_START = "07:30"  # Daily start time
 DAILY_OPERATION_END = "23:59"  # Daily end time
 DATA_FOLDER = "fish_data"  # Folder to store CSV and model data
 # YOLOv8 model path with fallback checks
-DEFAULT_MODEL_PATH = "runs/detect/train8/weights/best.pt"
-MODEL_PATH = DEFAULT_MODEL_PATH
+MODEL_PATH = "runs/detect/train8/weights/best.pt"
 DEBUG_MODE = False  # Set to False to disable debug output
-# Check if model exists, if not try to find it elsewhere
-if not os.path.exists(MODEL_PATH):
-    # Try alternative locations
-    alt_paths = [
-        "best.pt",
-        "weights/best.pt",
-        os.path.join(os.getcwd(), "best.pt")
-    ]
-    for path in alt_paths:
-        if os.path.exists(path):
-            MODEL_PATH = path
-            print(f"Found model at: {MODEL_PATH}")
-            break
-    # If still not found, we'll use a default YOLO model later
 
 # Create data folder if it doesn't exist
 os.makedirs(DATA_FOLDER, exist_ok=True)
 
+# Check for CUDA availability
+CUDA_AVAILABLE = False
+try:
+    cuda_count = cv2.cuda.getCudaEnabledDeviceCount()
+    if cuda_count > 0:
+        CUDA_AVAILABLE = True
+        print(f"CUDA is available for OpenCV with {cuda_count} device(s)!")
+    else:
+        print("CUDA is available in OpenCV API but no CUDA devices found.")
+except Exception as e:
+    print(f"OpenCV CUDA support not available: {e}")
+
+# No need to try exporting to TensorRT if CUDA isn't available for PyTorch
+if os.path.exists(MODEL_PATH) and CUDA_AVAILABLE:
+    try:
+        # Don't rely on PyTorch CUDA for Jetson - use TensorRT directly
+        # The YOLO model will use TensorRT optimizations automatically
+        print("Model found. Will use for inference without TensorRT export.")
+    except Exception as e:
+        print(f"Error with model: {e}")
+        print("Will use standard model instead.")
+
+def datetime_to_epoch(dt_obj):
+    """Convert datetime object to epoch seconds reliably for PyQtGraph"""
+    if isinstance(dt_obj, datetime.datetime):
+        return (dt_obj - datetime.datetime(1970, 1, 1)).total_seconds()
+    elif isinstance(dt_obj, (int, float)) and dt_obj > 1e9:  # Already looks like an epoch timestamp
+        return dt_obj
+    else:
+        # Return current time as fallback
+        print(f"WARNING: Could not convert {dt_obj} to epoch time, using current time")
+        return time.time()
+
+def ensure_datetime(timestamp):
+    """Ensure a timestamp is converted to a datetime object"""
+    if isinstance(timestamp, datetime.datetime):
+        return timestamp
+    elif isinstance(timestamp, (int, float)) and timestamp > 1e9:  # Epoch timestamp
+        return datetime.datetime.fromtimestamp(timestamp)
+    elif isinstance(timestamp, str):
+        # Try to parse string to datetime
+        try:
+            return datetime.datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            try:
+                return datetime.datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S.%f")
+            except ValueError:
+                # Last resort, return current time
+                print(f"WARNING: Could not parse timestamp string: {timestamp}")
+                return datetime.datetime.now()
+    else:
+        # Default fallback
+        print(f"WARNING: Unknown timestamp format: {timestamp}")
+        return datetime.datetime.now()
 
 class KalmanTracker:
     """Tracker for fish speed estimation with speed Kalman filter only"""
@@ -166,7 +196,7 @@ class KalmanTracker:
                 # Get filtered speed
                 self.filtered_speed = float(self.speed_kf.x[0])
 
-                if DEBUG_MODE:# Debug output to compare raw vs filtered
+                if DEBUG_MODE:  # Debug output to compare raw vs filtered
                     print(f"Fish speed - Raw: {self.raw_speed:.2f}, Filtered: {self.filtered_speed:.2f} BL/s")
 
         return np.array([cx, cy])
@@ -180,7 +210,7 @@ class KalmanTracker:
 
 
 class VideoThread(QThread):
-    """Thread for processing video frames with YOLO detection"""
+    """Thread for processing video frames with YOLO detection - optimized version"""
     frame_ready = pyqtSignal(np.ndarray, list, float, float)
 
     def __init__(self, camera_source=0):
@@ -190,67 +220,142 @@ class VideoThread(QThread):
         self.trackers = {}
         self.next_id = 0
         self.model = None
-        self.speed_history = deque(maxlen=600)  # Limit to 10 minutes of data (at 1 sample per second)
+
+        self.speed_history = deque(maxlen=600)
         self.variance_history = deque(maxlen=600)
         self.timestamps = deque(maxlen=600)
 
-        # Rolling window for real-time analysis only - constantly overwritten
-        self.current_window_speeds = deque(maxlen=300)  # Just 5 minutes (monitoring window)
+        self.current_window_speeds = deque(maxlen=300)
         self.current_window_variances = deque(maxlen=300)
         self.current_window_timestamps = deque(maxlen=300)
 
-        # Permanent storage only for significant events
-        self.feeding_event_data = []  # List of dictionaries containing pre/during/post data
+        # Initialize with some data for graphs
         self.ensure_data_collection()
 
+    # When adding data from your video thread
+    def add_data_point(self, timestamp, speed, variance, event_type=None):
+        """Add a data point with verified timestamp format"""
+        # Convert timestamp to datetime if it's not already
+        if not isinstance(timestamp, datetime.datetime):
+            try:
+                if isinstance(timestamp, (int, float)) and timestamp > 1e9:
+                    timestamp = datetime.datetime.fromtimestamp(timestamp)
+                elif isinstance(timestamp, str):
+                    timestamp = datetime.datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+            except Exception as e:
+                print(f"Error converting timestamp: {e}")
+                timestamp = datetime.datetime.now()  # Use current time as fallback
+
+        # Add to rolling window with verified datetime object
+        self.current_window_speeds.append(speed)
+        self.current_window_variances.append(variance)
+        self.current_window_timestamps.append(timestamp)
+
     def run(self):
+        """Thread for processing video frames with YOLO detection - optimized version"""
         print("VideoThread started. Initialising data collection...")
         try:
+            # Target resolution - force 640 x 640
+            target_width, target_height = 640, 480
             # Check if model path exists
             if not os.path.exists(MODEL_PATH):
                 print(f"ERROR: Model file not found at {MODEL_PATH}")
                 print("Using YOLO default model for testing purposes.")
                 # Use a default YOLO model for testing
-                self.model = YOLO("yolov8n.pt")
+                self.model = YOLO("yolov8n.pt")  # Use smaller model for better performance
             else:
-                # Load YOLOv8 model
-                self.model = YOLO(MODEL_PATH)
+                # Try to load engine file first
+                engine_path = os.path.splitext(MODEL_PATH)[0] + '.engine'
+                if os.path.exists(engine_path):
+                    try:
+                        print(f"Loading TensorRT engine from {engine_path}")
+                        self.model = YOLO(engine_path)
+                        print("TensorRT engine loaded successfully")
+                    except Exception as e:
+                        print(f"Error loading engine: {e}")
+                        print("Falling back to original model")
+                        self.model = YOLO(MODEL_PATH)
+                else:
+                    # Load regular model
+                    print(f"Loading standard model from {MODEL_PATH}")
+                    self.model = YOLO(MODEL_PATH)
 
-            # Open camera with error handling
+            # Check for CUDA - DO NOT force CPU mode
+            import torch
+            if torch.cuda.is_available():
+                try:
+                    print("CUDA is available, using for inference")
+                    # Let the model use CUDA naturally
+                except Exception as e:
+                    print(f"Error using CUDA: {e}")
+            else:
+                print("CUDA not available, using CPU")
+
+
             try:
-                cap = cv2.VideoCapture(self.camera_source)
-                if not cap.isOpened():
-                    print(f"ERROR: Failed to open camera source {self.camera_source}")
-                    print("Using test video or fallback mechanism...")
-                    # Try another source or create a black frame for testing
-                    cap = cv2.VideoCapture(0)  # Try default camera
+                # Initialize video capture with multiple fallback options
+                cap = None
+
+                # Try method 1: V4L2 with MJPG format
+                try:
+                    print("Trying V4L2 with MJPG format...")
+                    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+                    cap.set(cv2.CAP_PROP_FPS, 60)
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
+
                     if not cap.isOpened():
-                        # Create dummy frames for testing UI
-                        while self.running:
-                            dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                            cv2.putText(dummy_frame, "Camera Unavailable", (50, 240),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                        print("Failed to open with V4L2+MJPG")
+                        cap = None
+                    else:
+                        print("Successfully opened camera with V4L2+MJPG")
+                except Exception as e:
+                    print(f"Error with V4L2+MJPG: {e}")
+                    cap = None
 
-                            # Use dummy data
-                            tracks = []
-                            avg_speed = 0.5 + 0.2 * np.sin(time.time())
-                            speed_variance = 0.1 + 0.05 * np.cos(time.time())
+                # Try method 2: Standard capture
+                if cap is None or not cap.isOpened():
+                    try:
+                        print("Trying standard capture...")
+                        cap = cv2.VideoCapture(0)
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
 
-                            # Record dummy data
-                            current_time = datetime.datetime.now()
-                            self.speed_history.append(avg_speed)
-                            self.variance_history.append(speed_variance)
-                            self.timestamps.append(current_time)
+                        if not cap.isOpened():
+                            print("Failed to open with standard capture")
+                            cap = None
+                        else:
+                            print("Successfully opened camera with standard capture")
+                    except Exception as e:
+                        print(f"Error with standard capture: {e}")
+                        cap = None
 
-                            # Emit frame
-                            self.frame_ready.emit(dummy_frame, tracks, avg_speed, speed_variance)
-                            time.sleep(0.1)
-                        return
+                # Final fallback
+                if cap is None or not cap.isOpened():
+                    print("All camera methods failed. Using fallback.")
+                    self.handle_camera_failure()
+                    return
+
+                # Get actual camera properties
+                actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                actual_height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                print(f"Camera reports resolution: {actual_width}x{actual_height}")
+
             except Exception as e:
                 print(f"Camera initialisation error: {e}")
+                self.handle_camera_failure()
                 return
 
             self.running = True
+            last_data_time = time.time()  # Track last time we added to data collections
+            frame_count = 0
+            last_fps_check = time.time()
+
+            # Initialize buffer for moving average
+            speed_buffer = []
+            variance_buffer = []
+            buffer_size = 5  # Average over 5 frames for smoother readings
 
             while self.running and cap.isOpened():
                 try:
@@ -261,25 +366,52 @@ class VideoThread(QThread):
                         time.sleep(0.5)
                         continue
 
+
+                    if frame.shape[1] != target_width or frame.shape[0] != target_height:
+                        frame = cv2.resize(frame, (target_width, target_height))
+
+                    # Skip processing if graph update is in progress
+                    graph_update_in_progress = False
+                    if hasattr(self, 'parent'):
+                        graph_update_in_progress = getattr(self.parent, 'updating_graphs', False)
+
+                    if graph_update_in_progress:
+                        # Skip this frame
+                        continue
+
                     # Run YOLOv8 detection and tracking
                     try:
-                        results = self.model.track(frame, persist=True, tracker="bytetrack.yaml", conf=0.7)
+                        results = self.model.track(
+                            frame,
+                            persist=True,
+                            tracker="bytetrack.yaml",
+                            conf=0.7,  # Lower confidence threshold
+                            iou=0.5,
+                            agnostic_nms=True,
+                            verbose=True
+                        )
                     except Exception as e:
                         print(f"YOLO tracking error: {e}")
+                        # Continue with empty results
+                        tracks = []
+                        avg_speed = 0.0 if not self.speed_history else self.speed_history[-1]
+                        speed_variance = 0.0 if not self.variance_history else self.variance_history[-1]
+                        self.frame_ready.emit(frame, tracks, avg_speed, speed_variance)
+                        continue
                         # Use empty results
                         tracks = []
                         avg_speed = 0.0 if not self.speed_history else self.speed_history[-1]
                         speed_variance = 0.0 if not self.variance_history else self.variance_history[-1]
 
-                        # Record data
-                        current_time = datetime.datetime.now()
-                        self.speed_history.append(avg_speed)
-                        self.variance_history.append(speed_variance)
-                        self.timestamps.append(current_time)
-
-                        if DEBUG_MODE:
-                            print(
-                                f"Added data point: Speed={avg_speed:.2f}, Variance={speed_variance:.2f}, Total points={len(self.speed_history)}")
+                        # Only record data points at 1-second intervals to reduce data volume
+                        if time.time() - last_data_time >= 1.0:
+                            current_time = datetime.datetime.now()
+                            midnight = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+                            seconds_since_midnight = (current_time - midnight).total_seconds()
+                            self.speed_history.append(avg_speed)
+                            self.variance_history.append(speed_variance)
+                            self.timestamps.append(seconds_since_midnight)
+                            last_data_time = time.time()
 
                         # Emit frame
                         self.frame_ready.emit(frame, tracks, avg_speed, speed_variance)
@@ -326,30 +458,43 @@ class VideoThread(QThread):
                                 speeds = []
 
                         # Calculate average speed and variance for this frame
+                        current_time = datetime.datetime.now()
                         if speeds:
-                            current_time = datetime.datetime.now()
                             avg_speed = np.mean(speeds)
                             speed_variance = np.var(speeds) if len(speeds) > 1 else 0
                         else:
-                            current_time = datetime.datetime.now()
                             # Use previous values or defaults
                             avg_speed = 0.0 if not self.speed_history else self.speed_history[-1]
                             speed_variance = 0.0 if not self.variance_history else self.variance_history[-1]
 
-                        self.speed_history.append(avg_speed)
-                        self.variance_history.append(speed_variance)
-                        self.timestamps.append(current_time)
+                        # Add to moving average buffer
+                        speed_buffer.append(avg_speed)
+                        variance_buffer.append(speed_variance)
+                        if len(speed_buffer) > buffer_size:
+                            speed_buffer.pop(0)
+                            variance_buffer.pop(0)
 
-                        if DEBUG_MODE:
-                            print(
-                                f"Added data point: Speed={avg_speed:.2f}, Variance={speed_variance:.2f}, Total points={len(self.speed_history)}")
+                        # Use moving average for smoother readings
+                        smoothed_speed = np.mean(speed_buffer)
+                        smoothed_variance = np.mean(variance_buffer)
 
-                        # Emit frame with tracking data and metrics
+                        # Only record data points at 1-second intervals to reduce data volume
+                        if time.time() - last_data_time >= 1.0:
+                            self.speed_history.append(smoothed_speed)
+                            self.variance_history.append(smoothed_variance)
+                            self.timestamps.append(current_time)
+                            last_data_time = time.time()
+
+                            if DEBUG_MODE:
+                                print(
+                                    f"Added data point: Speed={smoothed_speed:.2f}, Variance={smoothed_variance:.2f}, Total points={len(self.speed_history)}")
+
+                        # Emit frame with tracking data and metrics - using smoothed values
                         self.frame_ready.emit(
                             frame,
                             tracks,
-                            avg_speed,
-                            speed_variance
+                            smoothed_speed,
+                            smoothed_variance
                         )
                     else:
                         # No results, emit frame with empty tracking
@@ -357,22 +502,21 @@ class VideoThread(QThread):
                         avg_speed = 0.0 if not self.speed_history else self.speed_history[-1]
                         speed_variance = 0.0 if not self.variance_history else self.variance_history[-1]
 
-                        self.speed_history.append(avg_speed)
-                        self.variance_history.append(speed_variance)
-                        self.timestamps.append(current_time)
-
-                        if DEBUG_MODE:
-                            print(
-                                f"Added data point: Speed={avg_speed:.2f}, Variance={speed_variance:.2f}, Total points={len(self.speed_history)}")
+                        # Only record data points at 1-second intervals
+                        if time.time() - last_data_time >= 1.0:
+                            self.speed_history.append(avg_speed)
+                            self.variance_history.append(speed_variance)
+                            self.timestamps.append(current_time)
+                            last_data_time = time.time()
 
                         self.frame_ready.emit(frame, [], avg_speed, speed_variance)
 
-                    # Small delay to reduce CPU usage
+                    # Small delay to reduce CPU usage - we don't need to process every frame
+                    # This helps stabilize performance
                     time.sleep(0.01)
 
                 except Exception as e:
                     print(f"Frame processing error: {e}")
-                    import traceback
                     traceback.print_exc()
                     time.sleep(0.5)  # Delay before trying again
 
@@ -380,32 +524,90 @@ class VideoThread(QThread):
 
         except Exception as e:
             print(f"Video thread critical error: {e}")
-            import traceback
             traceback.print_exc()
+
+    def handle_camera_failure(self):
+        """Handle failure to open camera by creating dummy frames"""
+        while self.running:
+            dummy_frame = np.zeros((640, 640, 3), dtype=np.uint8)
+            cv2.putText(dummy_frame, "Camera Unavailable", (50, 240),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+            # Use dummy data
+            tracks = []
+            avg_speed = 0.5 + 0.2 * np.sin(time.time())
+            speed_variance = 0.1 + 0.05 * np.cos(time.time())
+
+            # Record dummy data at 1 second intervals
+            current_time = datetime.datetime.now()
+            if not hasattr(self, 'last_data_timestamp') or (
+                    current_time - self.last_data_timestamp).total_seconds() >= 1.0:
+                self.speed_history.append(avg_speed)
+                self.variance_history.append(speed_variance)
+                self.timestamps.append(current_time)
+                self.last_data_timestamp = current_time
+
+            # Emit frame
+            self.frame_ready.emit(dummy_frame, tracks, avg_speed, speed_variance)
+            time.sleep(0.1)
 
     def stop(self):
         self.running = False
         self.wait()
 
-    def get_speed_data(self):
+    def get_speed_data(self, window_seconds=None):
+        """Get speed data, optionally limited to the recent time window
+
+        Args:
+            window_seconds: If provided, only return data from the last window_seconds.
+                        If None, return all data.
+        """
         if DEBUG_MODE:
             print(f"get_speed_data called. Data points: {len(self.timestamps)}")
             if len(self.timestamps) > 0:
                 print(f"First timestamp: {self.timestamps[0]}, Last timestamp: {self.timestamps[-1]}")
                 print(
                     f"Speed range: {min(self.speed_history) if self.speed_history else 0}-{max(self.speed_history) if self.speed_history else 0}")
-        return list(self.timestamps), list(self.speed_history), list(self.variance_history)
+
+        # If no window specified or not enough data, return all data
+        if window_seconds is None or len(self.timestamps) < 2:
+            return list(self.timestamps), list(self.speed_history), list(self.variance_history)
+
+        # Calculate window based on most recent timestamp
+        if self.timestamps:
+            current_time = self.timestamps[-1]
+            cutoff_time = current_time - datetime.timedelta(seconds=window_seconds)
+
+            # Find index of first timestamp in window
+            start_idx = 0
+            for i, ts in enumerate(self.timestamps):
+                if ts >= cutoff_time:
+                    start_idx = i
+                    break
+
+            # Return sliced data
+            return (list(self.timestamps)[start_idx:],
+                    list(self.speed_history)[start_idx:],
+                    list(self.variance_history)[start_idx:])
+
+        # Fallback if no timestamps
+        return [], [], []
+
+    def get_current_window_data(self):
+        """Return the current 5-minute window for analysis"""
+        return list(self.current_window_timestamps), list(self.current_window_speeds), list(
+            self.current_window_variances)
 
     def ensure_data_collection(self):
-        """Add dummy data if necessary for testing graphs"""
+        """Add minimal dummy data if necessary for testing graphs"""
         if len(self.timestamps) < 2:
             if DEBUG_MODE:
-                print("Adding initial dummy data points for graph testing")
+                print("Adding minimal dummy data points for graph testing")
 
             current_time = datetime.datetime.now()
             earlier_time = current_time - datetime.timedelta(seconds=10)
 
-            # Add two points 10 seconds apart to establish timeline
+            # Add just two points 10 seconds apart to establish timeline
             self.timestamps.append(earlier_time)
             self.speed_history.append(0.5)
             self.variance_history.append(0.1)
@@ -415,316 +617,350 @@ class VideoThread(QThread):
             self.variance_history.append(0.2)
 
             if DEBUG_MODE:
-                print(f"Added dummy points. Now have {len(self.timestamps)} timestamps")
+                print(f"Added minimal dummy points. Now have {len(self.timestamps)} timestamps")
 
-    # You might also want to add a method to purge old data
-    def purge_old_data(self, max_age_seconds=600):
-        """Remove data older than max_age_seconds (10 minutes) to prevent memory issues"""
-        if not self.timestamps:
-            return
 
-        current_time = datetime.datetime.now()
-        cutoff_time = current_time - datetime.timedelta(seconds=max_age_seconds)
+class TimeAxisItem(pg.AxisItem):
+    def tickStrings(self, values, scale, spacing):
+        """Convert timestamp values to readable time strings for PyQtGraph axis"""
+        try:
+            # Format as actual clock time (HH:MM:SS)
+            time_strings = []
 
-        # Find index of first item newer than cutoff
-        cutoff_index = 0
-        for i, timestamp in enumerate(self.timestamps):
-            if timestamp >= cutoff_time:
-                cutoff_index = i
-                break
+            for value in values:
+                # Skip invalid values
+                if not np.isfinite(value):
+                    time_strings.append('')
+                    continue
 
-        # If we found old data, remove it
-        if cutoff_index > 0:
-            # Convert to list, truncate, and convert back to deque
-            timestamps = list(self.timestamps)[cutoff_index:]
-            speeds = list(self.speed_history)[cutoff_index:]
-            variances = list(self.variance_history)[cutoff_index:]
+                # PyQtGraph works with float values - convert to datetime for formatting
+                if value > 1e9:  # Unix timestamps are typically large numbers
+                    # Convert epoch seconds to datetime
+                    try:
+                        # Apply timezone adjustment for display purposes
+                        # From UTC time to local time (UTC-8)
+                        dt = datetime.datetime.fromtimestamp(value)
+                        # If needed, adjust the time to match your local timezone
+                        dt = dt - datetime.timedelta(hours=8)  # Uncomment and adjust if necessary
+                        time_strings.append(dt.strftime('%H:%M:%S'))
+                    except (ValueError, OverflowError):
+                        # Fallback if conversion fails
+                        time_strings.append(f"{value:.1f}")
+                else:
+                    # Fallback for non-timestamp values
+                    time_strings.append(f"{value:.1f}")
 
-            self.timestamps = deque(timestamps, maxlen=self.timestamps.maxlen)
-            self.speed_history = deque(speeds, maxlen=self.speed_history.maxlen)
-            self.variance_history = deque(variances, maxlen=self.variance_history.maxlen)
+            return time_strings
+        except Exception as e:
+            print(f"Error formatting time axis: {e}")
+            # Fallback to default formatting
+            return [str(v) for v in values]
 
-            print(f"Purged {cutoff_index} old data points to save memory")
+class SpeedGraph(QWidget):
+    """PyQtGraph implementation for displaying speed metrics"""
 
-    def get_current_window_data(self):
-        """Return the current 5-minute window for analysis"""
-        return list(self.current_window_timestamps), list(self.current_window_speeds), list(
-            self.current_window_variances)
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout()
+        self.setLayout(layout)
 
-    def get_feeding_event_data(self, event_type=None):
-        """Get feeding event data, optionally filtered by event type"""
-        if event_type:
-            return [data for data in self.feeding_event_data if data.get("event_type") == event_type]
-        return self.feeding_event_data
+        # Create time axis for x-axis
+        time_axis = TimeAxisItem(orientation='bottom')
 
-    def add_data_point(self, timestamp, speed, variance, event_type=None):
-        """Add a data point with optional event tagging"""
-        # Add to rolling window
-        self.current_window_speeds.append(speed)
-        self.current_window_variances.append(variance)
-        self.current_window_timestamps.append(timestamp)
+        # Create plot widget with custom time axis
+        self.plot_widget = pg.PlotWidget(axisItems={'bottom': time_axis})
+        layout.addWidget(self.plot_widget)
 
-        # If this is a significant event, store it permanently
-        if event_type:
-            if not hasattr(self, 'feeding_event_data'):
-                self.feeding_event_data = []
+        # Configure plot
+        self.plot_widget.setBackground('w')  # White background
+        self.plot_widget.setLabel('left', 'Speed (BL/s)')
+        self.plot_widget.setLabel('bottom', 'Time')
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_widget.setYRange(0, 2)  # Initial y range
 
-            self.feeding_event_data.append({
-                "timestamp": timestamp,
-                "speed": speed,
-                "variance": variance,
-                "event_type": event_type
-            })
+        self.setMinimumHeight(200)
 
-class SpeedGraph(FigureCanvasQTAgg):
-    """Matplotlib graph for displaying speed metrics"""
+        # Create plot data item for speed line
+        self.speed_line = self.plot_widget.plot(pen=pg.mkPen(color='b', width=2))
 
-    def __init__(self, parent=None, width=5, height=3, dpi=100):
-        plt.ioff()  # Turn off interactive mode
-        self.fig = Figure(figsize=(width, height), dpi=dpi)
-        self.axes = self.fig.add_subplot(111)
-        super(SpeedGraph, self).__init__(self.fig)
-        self.setParent(parent)
+        # Placeholders for vertical markers (e.g., missed feedings)
+        self.markers = []
 
-        # Initialize plot with empty data
-        self.speed_line, = self.axes.plot([], [], 'b-', label='Average Speed', linewidth=1)
-        self.axes.set_ylim(0, 2)
-        self.axes.set_title('Fish Speed (body lengths/second)')
-        self.axes.set_xlabel('Time')
-        self.axes.set_ylabel('Speed')
-        self.axes.legend(loc='upper right')
-        self.axes.grid(True)
-        self.fig.tight_layout()
+        # Store references to data
+        self.dates = []
+        self.speeds = []
 
-        # For satiated region and window
+        # For satiated region and tracking if data has been plotted
         self.satiated_region = None
-        self.window_indicator = None
-
-        # For tracking if data has been plotted
         self.has_data = False
-        print("SpeedGraph initialized")
+
+        print("PyQtGraph SpeedGraph initialized")
 
     def update_plot(self, timestamps, speeds, satiated_range=None):
-        if DEBUG_MODE:
-            print(f"SpeedGraph.update_plot called with {len(timestamps)} points")
+        """Updated method for updating PyQtGraph plots with proper timestamp handling"""
+        # Determine if this is speed or variance graph
+        graph_type = 'Speed' if hasattr(self, 'speed_line') else 'Variance'
+
 
         if not timestamps or not speeds or len(timestamps) < 2:
-            print("Not enough data points to plot speed")
+            print("Not enough data points, skipping update")
             return
 
         try:
-            # Convert timestamps to matplotlib format - FIXED LINE
-            import matplotlib.dates
-            dates = matplotlib.dates.date2num(timestamps)
-            if DEBUG_MODE:
-                print(f"Speed data range: {min(speeds):.2f}-{max(speeds):.2f}")
+            # Make sure timestamps and values have the same length
+            min_length = min(len(timestamps), len(speeds))
+            timestamps = timestamps[-min_length:]
+            values = speeds[-min_length:]
 
-            # Update data
-            self.speed_line.set_data(dates, speeds)
+            # First ensure we have datetime objects
+            dt_timestamps = []
+            for ts in timestamps:
+                if isinstance(ts, datetime.datetime):
+                    dt_timestamps.append(ts)
+                else:
+                    # Use our helper to convert to datetime
+                    dt_timestamps.append(self.parent().ensure_datetime(ts))
 
-            # Set x limits based on data
-            self.axes.set_xlim(min(dates), max(dates))
+            # Find the current time and the cutoff time (5 minutes ago)
+            current_time = dt_timestamps[-1]  # Most recent timestamp
+            cutoff_time = current_time - datetime.timedelta(seconds=300)  # 5 minutes before latest timestamp
 
-            # Set y limits based on data (with padding)
-            max_speed = max(speeds) if speeds else 2
-            self.axes.set_ylim(0, max(2, max_speed * 1.2))
+            # Find the index where we should start (first point after cutoff)
+            start_idx = 0
+            for i, ts in enumerate(dt_timestamps):
+                if ts >= cutoff_time:
+                    start_idx = i
+                    break
 
-            # Format x-axis
-            from matplotlib.dates import DateFormatter
-            self.axes.xaxis.set_major_formatter(DateFormatter('%H:%M:%S'))
-            for label in self.axes.get_xticklabels():
-                label.set_rotation(45)
-                label.set_ha('right')
+            # Create window of data - only the last 5 minutes
+            window_timestamps = dt_timestamps[start_idx:]
+            window_values = values[start_idx:]
 
-            # Force line to be visible with specific style
-            self.speed_line.set_visible(True)
-            self.speed_line.set_linewidth(1)
-            self.speed_line.set_color('blue')
+            # Convert datetime timestamps to epoch time for PyQtGraph
+            epoch_times = []
+            for ts in window_timestamps:
+                epoch_times.append(datetime_to_epoch(ts))
 
-            # Print the actual plot data for debugging
-            if DEBUG_MODE:
-                x_data, y_data = self.speed_line.get_data()
-                print(f"Plotting speed data: {len(x_data)} points")
-                if len(x_data) > 0:
-                    print(f"X range: {min(x_data):.2f}-{max(x_data):.2f}, Y range: {min(y_data):.2f}-{max(y_data):.2f}")
-                    print(f"Axes limits: x={self.axes.get_xlim()}, y={self.axes.get_ylim()}")
+            # Update data in plot
+            if hasattr(self, 'speed_line'):
+                self.speed_line.setData(epoch_times, window_values)
+            elif hasattr(self, 'variance_line'):
+                self.variance_line.setData(epoch_times, window_values)
+
+            # Update x range to show all data
+            if len(epoch_times) >= 2:
+                self.plot_widget.setXRange(min(epoch_times), max(epoch_times))
+
+                # Update y range based on data with some padding
+                max_value = max(window_values) if window_values else (2 if hasattr(self, 'speed_line') else 1)
+                min_y = 0
+                max_y = max(2 if hasattr(self, 'speed_line') else 1, max_value * 1.2)
+                self.plot_widget.setYRange(min_y, max_y)
 
             # Handle satiated region
-            if hasattr(self, 'satiated_region') and self.satiated_region is not None:
-                try:
-                    self.satiated_region.remove()
-                    self.satiated_region = None
-                except:
-                    pass  # Ignore removal errors
+            if satiated_range and satiated_range != getattr(self, 'last_satiated_range', None):
+                self.last_satiated_range = satiated_range
 
-            if satiated_range:
+                # Remove old region if it exists
+                if hasattr(self, 'satiated_region') and self.satiated_region:
+                    self.plot_widget.removeItem(self.satiated_region)
+
+                # Create new region
                 y_min, y_max = satiated_range
-                self.satiated_region = self.axes.axhspan(y_min, y_max, alpha=0.2, color='green', label='Satiated Range')
-
-            # Handle window indicator
-            if hasattr(self, 'window_indicator') and self.window_indicator is not None:
-                try:
-                    self.window_indicator.remove()
-                    self.window_indicator = None
-                except:
-                    pass  # Ignore removal errors
-
-            if len(dates) > 2:
-                # Calculate window start (5 minutes before last point)
-                window_start_date = max(dates) - MONITORING_WINDOW / (24 * 60 * 60)
-
-                # Find index of window start
-                window_start_index = 0
-                for i, date in enumerate(dates):
-                    if date >= window_start_date:
-                        window_start_index = i
-                        break
-
-                # Add window indicator
-                if window_start_index < len(dates):
-                    self.window_indicator = self.axes.axvspan(
-                        dates[window_start_index], dates[-1],
-                        alpha=0.15, color='blue', label='Analysis Window'
-                    )
+                self.satiated_region = pg.LinearRegionItem(
+                    values=[y_min, y_max],
+                    orientation=pg.LinearRegionItem.Horizontal,
+                    brush=pg.mkBrush(0, 255, 0, 50),  # Semi-transparent green
+                    movable=False
+                )
+                self.plot_widget.addItem(self.satiated_region)
 
             # Mark that we have data
             self.has_data = True
 
-            # Force redraw
-            self.fig.canvas.draw()
-
-            print("Speed graph updated successfully")
-
         except Exception as e:
-            print(f"Error updating speed graph: {e}")
+            print(f"Error updating {graph_type.lower()} graph: {e}")
             import traceback
             traceback.print_exc()
 
+    def add_missed_feeding_marker(self, timestamp):
+        """Add a vertical line to indicate a missed feeding event"""
+        if isinstance(timestamp, datetime.datetime):
+            # Convert to epoch time
+            epoch_time = (timestamp - datetime.datetime(1970, 1, 1)).total_seconds()
 
-class VarianceGraph(FigureCanvasQTAgg):
-    """Matplotlib graph for displaying variance metrics"""
+            # Create vertical line
+            line = pg.InfiniteLine(
+                pos=epoch_time,
+                angle=90,
+                pen=pg.mkPen(color='b', width=1, style=Qt.DashLine),
+                label=f"Missed {timestamp.strftime('%H:%M')}"
+            )
 
-    def __init__(self, parent=None, width=5, height=3, dpi=100):
-        plt.ioff()  # Turn off interactive mode
-        self.fig = Figure(figsize=(width, height), dpi=dpi)
-        self.axes = self.fig.add_subplot(111)
-        super(VarianceGraph, self).__init__(self.fig)
-        self.setParent(parent)
+            # Add to plot and store reference
+            self.plot_widget.addItem(line)
+            self.markers.append(line)
+            return line
+        return None
 
-        # Initialize plot with empty data
-        self.variance_line, = self.axes.plot([], [], 'r-', label='Speed Variance', linewidth=1)
-        self.axes.set_ylim(0, 1)
-        self.axes.set_title('Speed Variance')
-        self.axes.set_xlabel('Time')
-        self.axes.set_ylabel('Variance')
-        self.axes.legend(loc='upper right')
-        self.axes.grid(True)
-        self.fig.tight_layout()
+    def clear_markers(self):
+        """Remove all markers from the plot"""
+        for marker in self.markers:
+            self.plot_widget.removeItem(marker)
+        self.markers = []
 
-        # For satiated region and window
+
+class VarianceGraph(QWidget):
+    """PyQtGraph implementation for displaying variance metrics"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+
+        # Create time axis for x-axis
+        time_axis = TimeAxisItem(orientation='bottom')
+
+        # Create plot widget with custom time axis
+        self.plot_widget = pg.PlotWidget(axisItems={'bottom': time_axis})
+        layout.addWidget(self.plot_widget)
+
+        # Configure plot
+        self.plot_widget.setBackground('w')  # White background
+        self.plot_widget.setLabel('left', 'Variance')
+        self.plot_widget.setLabel('bottom', 'Time')
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_widget.setYRange(0, 1)  # Initial y range
+
+        self.setMinimumHeight(200)
+
+        # Create plot data item for variance line
+        self.variance_line = self.plot_widget.plot(pen=pg.mkPen(color='r', width=2))
+
+        # Placeholders for vertical markers (e.g., missed feedings)
+        self.markers = []
+
+        # Store references to data
+        self.dates = []
+        self.variances = []
+
+        # For satiated region and tracking if data has been plotted
         self.satiated_region = None
-        self.window_indicator = None
-
-        # For tracking if data has been plotted
         self.has_data = False
-        print("VarianceGraph initialized")
+
+        print("PyQtGraph VarianceGraph initialized")
 
     def update_plot(self, timestamps, variances, satiated_range=None):
-        if DEBUG_MODE:
-            print(f"VarianceGraph.update_plot called with {len(timestamps)} points")
+        """Updated method for updating PyQtGraph plots with proper timestamp handling"""
+        # Determine if this is speed or variance graph
+        graph_type = 'Speed' if hasattr(self, 'speed_line') else 'Variance'
 
         if not timestamps or not variances or len(timestamps) < 2:
-            print("Not enough data points to plot variance")
+            print("Not enough data points, skipping update")
             return
 
         try:
-            # Convert timestamps to matplotlib format - FIXED LINE
-            import matplotlib.dates
-            dates = matplotlib.dates.date2num(timestamps)
-            if DEBUG_MODE:
-                print(f"Variance data range: {min(variances):.2f}-{max(variances):.2f}")
+            # Make sure timestamps and values have the same length
+            min_length = min(len(timestamps), len(variances))
+            timestamps = timestamps[-min_length:]
+            values = variances[-min_length:]
 
-            # Update data
-            self.variance_line.set_data(dates, variances)
+            # First ensure we have datetime objects
+            dt_timestamps = []
+            for ts in timestamps:
+                if isinstance(ts, datetime.datetime):
+                    dt_timestamps.append(ts)
+                else:
+                    # Use our helper to convert to datetime
+                    dt_timestamps.append(self.parent().ensure_datetime(ts))
 
-            # Set x limits based on data
-            self.axes.set_xlim(min(dates), max(dates))
+            # Find the current time and the cutoff time (5 minutes ago)
+            current_time = dt_timestamps[-1]  # Most recent timestamp
+            cutoff_time = current_time - datetime.timedelta(seconds=300)  # 5 minutes before latest timestamp
 
-            # Set y limits based on data (with padding)
-            max_variance = max(variances) if variances else 1
-            self.axes.set_ylim(0, max(1, max_variance * 1.2))
+            # Find the index where we should start (first point after cutoff)
+            start_idx = 0
+            for i, ts in enumerate(dt_timestamps):
+                if ts >= cutoff_time:
+                    start_idx = i
+                    break
 
-            # Format x-axis
-            from matplotlib.dates import DateFormatter
-            self.axes.xaxis.set_major_formatter(DateFormatter('%H:%M:%S'))
-            for label in self.axes.get_xticklabels():
-                label.set_rotation(45)
-                label.set_ha('right')
+            # Create window of data - only the last 5 minutes
+            window_timestamps = dt_timestamps[start_idx:]
+            window_values = values[start_idx:]
 
-            # Force line to be visible with specific style
-            self.variance_line.set_visible(True)
-            self.variance_line.set_linewidth(1)
-            self.variance_line.set_color('red')
+            # Convert datetime timestamps to epoch time for PyQtGraph
+            epoch_times = []
+            for ts in window_timestamps:
+                epoch_times.append(datetime_to_epoch(ts))
 
-            # Print the actual plot data for debugging
-            x_data, y_data = self.variance_line.get_data()
-            if DEBUG_MODE:
-                print(f"Plotting variance data: {len(x_data)} points")
-                if len(x_data) > 0:
-                    print(f"X range: {min(x_data):.2f}-{max(x_data):.2f}, Y range: {min(y_data):.2f}-{max(y_data):.2f}")
-                    print(f"Axes limits: x={self.axes.get_xlim()}, y={self.axes.get_ylim()}")
+            # Update data in plot
+            if hasattr(self, 'speed_line'):
+                self.speed_line.setData(epoch_times, window_values)
+            elif hasattr(self, 'variance_line'):
+                self.variance_line.setData(epoch_times, window_values)
+
+            # Update x range to show all data
+            if len(epoch_times) >= 2:
+                self.plot_widget.setXRange(min(epoch_times), max(epoch_times))
+
+                # Update y range based on data with some padding
+                max_value = max(window_values) if window_values else (2 if hasattr(self, 'speed_line') else 1)
+                min_y = 0
+                max_y = max(2 if hasattr(self, 'speed_line') else 1, max_value * 1.2)
+                self.plot_widget.setYRange(min_y, max_y)
 
             # Handle satiated region
-            if hasattr(self, 'satiated_region') and self.satiated_region is not None:
-                try:
-                    self.satiated_region.remove()
-                    self.satiated_region = None
-                except:
-                    pass  # Ignore removal errors
+            if satiated_range and satiated_range != getattr(self, 'last_satiated_range', None):
+                self.last_satiated_range = satiated_range
 
-            if satiated_range:
+                # Remove old region if it exists
+                if hasattr(self, 'satiated_region') and self.satiated_region:
+                    self.plot_widget.removeItem(self.satiated_region)
+
+                # Create new region
                 y_min, y_max = satiated_range
-                self.satiated_region = self.axes.axhspan(y_min, y_max, alpha=0.2, color='green', label='Satiated Range')
-
-            # Handle window indicator
-            if hasattr(self, 'window_indicator') and self.window_indicator is not None:
-                try:
-                    self.window_indicator.remove()
-                    self.window_indicator = None
-                except:
-                    pass  # Ignore removal errors
-
-            if len(dates) > 2:
-                # Calculate window start (5 minutes before last point)
-                window_start_date = max(dates) - MONITORING_WINDOW / (24 * 60 * 60)
-
-                # Find index of window start
-                window_start_index = 0
-                for i, date in enumerate(dates):
-                    if date >= window_start_date:
-                        window_start_index = i
-                        break
-
-                # Add window indicator
-                if window_start_index < len(dates):
-                    self.window_indicator = self.axes.axvspan(
-                        dates[window_start_index], dates[-1],
-                        alpha=0.15, color='blue', label='Analysis Window'
-                    )
+                self.satiated_region = pg.LinearRegionItem(
+                    values=[y_min, y_max],
+                    orientation=pg.LinearRegionItem.Horizontal,
+                    brush=pg.mkBrush(0, 255, 0, 50),  # Semi-transparent green
+                    movable=False
+                )
+                self.plot_widget.addItem(self.satiated_region)
 
             # Mark that we have data
             self.has_data = True
 
-            # Force redraw
-            self.fig.canvas.draw()
-
-            print("Variance graph updated successfully")
-
         except Exception as e:
-            print(f"Error updating variance graph: {e}")
+            print(f"Error updating {graph_type.lower()} graph: {e}")
             import traceback
             traceback.print_exc()
 
+    def add_missed_feeding_marker(self, timestamp):
+        """Add a vertical line to indicate a missed feeding event"""
+        if isinstance(timestamp, datetime.datetime):
+            # Convert to epoch time
+            epoch_time = (timestamp - datetime.datetime(1970, 1, 1)).total_seconds()
+
+            # Create vertical line
+            line = pg.InfiniteLine(
+                pos=epoch_time,
+                angle=90,
+                pen=pg.mkPen(color='b', width=1, style=Qt.DashLine),
+                label=f"Missed {timestamp.strftime('%H:%M')}"
+            )
+
+            # Add to plot and store reference
+            self.plot_widget.addItem(line)
+            self.markers.append(line)
+            return line
+        return None
+
+    def clear_markers(self):
+        """Remove all markers from the plot"""
+        for marker in self.markers:
+            self.plot_widget.removeItem(marker)
+        self.markers = []
 
 class FeedingHistoryTable(QWidget):
     """Widget for displaying feeding history using a proper table widget"""
@@ -735,7 +971,7 @@ class FeedingHistoryTable(QWidget):
         self.setLayout(self.layout)
 
         # Initialize max visible rows
-        self.max_visible_rows = 10  # Default value
+        self.max_visible_rows = 8  # Show 8 rows instead of just 5
         self.full_history = []  # Store the full history
 
         # Create table widget with grid lines
@@ -753,8 +989,9 @@ class FeedingHistoryTable(QWidget):
         header.setStretchLastSection(False)
 
         # Set column sizing
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Time column
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # Dosages column
+        header.setSectionResizeMode(0, QHeaderView.Stretch)  # Time column stretches
+        header.setSectionResizeMode(1, QHeaderView.Fixed)    # Dosages column fixed width
+        self.table.setColumnWidth(1, 70)  # Fixed width for dosages
 
         # Set alternating row colors
         self.table.setAlternatingRowColors(True)
@@ -771,95 +1008,83 @@ class FeedingHistoryTable(QWidget):
             }
         """)
 
-        # Configure row height
+        # Configure row height - REDUCED to fit more rows
         self.table.verticalHeader().setVisible(False)  # Hide row numbers
-        self.table.verticalHeader().setDefaultSectionSize(24)  # Compact row height
+        self.table.verticalHeader().setDefaultSectionSize(20)  # Make rows more compact
 
         self.layout.addWidget(self.table)
         self.layout.setContentsMargins(0, 0, 0, 0)
 
     def update_history(self, feeding_history):
-        # Store the full feeding history
+        """Update the feeding history table with proper timestamp handling"""
+        print(f"update_history called with {len(feeding_history)} records")
+
+        # Store the full history
         self.full_history = feeding_history
 
-        # Clear table
+        # Clear table - IMPORTANT: Always reset row count to zero
         self.table.setRowCount(0)
 
-        # Calculate how many rows to show (use max_visible_rows if defined)
-        if hasattr(self, 'max_visible_rows'):
-            rows_to_show = min(len(feeding_history), self.max_visible_rows)
-        else:
-            rows_to_show = min(len(feeding_history), 10)  # Default to 10 rows
+        # Calculate how many rows to show
+        rows_to_show = min(len(feeding_history), self.max_visible_rows if hasattr(self, 'max_visible_rows') else 10)
 
         # Add rows for each feeding event (most recent first)
         for i, feed in enumerate(feeding_history[:rows_to_show]):
+            # Insert a new row
             self.table.insertRow(i)
 
-            # Format time to be more readable with %m/%d %H:%M
-            time_str = feed['timestamp'].strftime("%m/%d %H:%M")
+            # Format time with robust error handling
+            try:
+                timestamp = feed['timestamp']
+                # Handle different timestamp formats
+                if isinstance(timestamp, datetime.datetime):
+                    time_str = timestamp.strftime("%m/%d %H:%M")
+                elif isinstance(timestamp, str):
+                    # Try to parse string to datetime
+                    try:
+                        time_obj = datetime.datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+                        time_str = time_obj.strftime("%m/%d %H:%M")
+                    except ValueError:
+                        # If parsing fails, try another common format
+                        try:
+                            time_obj = datetime.datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S.%f")
+                            time_str = time_obj.strftime("%m/%d %H:%M")
+                        except ValueError:
+                            # Just use the string as is
+                            time_str = timestamp
+                elif isinstance(timestamp, (int, float)) and timestamp > 1e9:
+                    # Looks like an epoch timestamp
+                    time_obj = datetime.datetime.fromtimestamp(timestamp)
+                    time_str = time_obj.strftime("%m/%d %H:%M")
+                else:
+                    time_str = str(timestamp)
+            except Exception as e:
+                print(f"Error formatting timestamp: {e}")
+                time_str = "Unknown"
+
             time_item = QTableWidgetItem(time_str)
             self.table.setItem(i, 0, time_item)
 
-            # Display dosage count (or "Missed" if it was a missed feeding)
-            is_missed = feed.get('missed', False)
+            # Display dosage count with error handling
+            try:
+                # Check if this was a missed feeding
+                is_missed = feed.get('missed', False)
 
-            if is_missed:
-                dosage_item = QTableWidgetItem("Missed")
-                dosage_item.setForeground(QColor(100, 100, 255))  # Blue for missed
-            else:
-                dosage_count = feed.get('dosage_count', 1)
-                dosage_item = QTableWidgetItem(str(dosage_count))
-
-            dosage_item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(i, 1, dosage_item)
-
-    # Add to your SmartFishFeederApp class
-    def resizeEvent(self, event):
-        """Handle window resize event"""
-        # Call parent implementation if it exists
-        if hasattr(super(), 'resizeEvent'):
-            super().resizeEvent(event)
-
-        # Adjust table height based on available space
-        if hasattr(self, 'forecast_table'):
-            total_height = self.height()
-            if total_height < 800:  # Compact mode for smaller windows
-                self.forecast_table.setMaximumHeight(80)  # Show fewer rows
-                if hasattr(self, 'forecast_canvas_widget'):
-                    self.forecast_canvas_widget.setMinimumHeight(150)
-            else:  # More space in larger windows
-                self.forecast_table.setMaximumHeight(120)
-                if hasattr(self, 'forecast_canvas_widget'):
-                    self.forecast_canvas_widget.setMinimumHeight(180)
-
-    def update_display_rows(self):
-        """Update how many rows are displayed based on available space"""
-        # Store current data
-        current_data = []
-        for row in range(self.table.rowCount()):
-            row_data = []
-            for col in range(self.table.columnCount()):
-                item = self.table.item(row, col)
-                if item:
-                    row_data.append((item.text(), item.background()))
+                if is_missed:
+                    dosage_item = QTableWidgetItem("Missed")
+                    dosage_item.setForeground(QColor(100, 100, 255))  # Blue for missed
                 else:
-                    row_data.append(("", None))
-            current_data.append(row_data)
+                    # Get dosage count with fallback to 1
+                    dosage_count = feed.get('dosage_count', 1)
+                    dosage_item = QTableWidgetItem(str(dosage_count))
 
-        # Determine how many rows to show
-        rows_to_show = min(len(current_data), self.max_visible_rows)
+                dosage_item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(i, 1, dosage_item)
+            except Exception as e:
+                print(f"Error setting dosage item: {e}")
+                self.table.setItem(i, 1, QTableWidgetItem("?"))
 
-        # Reset table
-        self.table.setRowCount(rows_to_show)
-
-        # Refill with data
-        for row in range(rows_to_show):
-            for col in range(self.table.columnCount()):
-                text, bg = current_data[row][col]
-                item = QTableWidgetItem(text)
-                if bg:
-                    item.setBackground(bg)
-                self.table.setItem(row, col, item)
+        print(f"Table updated with {self.table.rowCount()} rows")
 
 class DataLogger:
     """Class for logging fish metrics to CSV with dosage count"""
@@ -895,7 +1120,6 @@ class SmartFishFeederApp(QMainWindow):
         self.direct_post_feeding_check_timer = QTimer()
         self.direct_post_feeding_check_timer.timeout.connect(self.direct_post_feeding_check)
         self.direct_post_feeding_check_timer.start(1000)  # Check every second
-        print("Started direct post-feeding check timer")
 
         # Enable exception handling for slots
         sys.excepthook = self.excepthook
@@ -914,7 +1138,8 @@ class SmartFishFeederApp(QMainWindow):
             self.video_thread = VideoThread()
             self.feeding_model = ProphetFeedingModel()
             self.data_logger = DataLogger()
-
+            self.video_thread.parent = self
+            self.initialize_mode_tracking()
             self.feeding_active = False
             self.feed_start_time = None
             self.pre_feeding_speeds = []
@@ -923,7 +1148,7 @@ class SmartFishFeederApp(QMainWindow):
             self.during_feeding_variances = []
             self.post_feeding_speeds = []
             self.post_feeding_variances = []
-            # Replace with:
+            self.updating_graphs = False
             self.system_mode = "initialising"  # initialising, monitoring, pre_feeding, feeding, post_feeding, cooldown
             self.last_feed_check = datetime.datetime.now()
             self.last_dosage_time = None
@@ -931,9 +1156,15 @@ class SmartFishFeederApp(QMainWindow):
             self.cooldown_active = False
             self.cooldown_end_time = None
 
+            self.setup_resource_monitoring()
+            self.last_memory_log = datetime.datetime.now()
+
+            self.setup_resource_monitoring()
+            self.last_memory_log = datetime.datetime.now()
+
             # Check if we should be in cooldown based on last feeding time
-            if self.feeding_model.feeding_history:
-                last_feed = self.feeding_model.feeding_history[-1]['timestamp']
+            if self.feeding_model.get_feeding_history():
+                last_feed = self.feeding_model.get_feeding_history()[-1]['timestamp']
                 time_since_last_feed = (datetime.datetime.now() - last_feed).total_seconds()
 
                 if time_since_last_feed < MIN_FEED_INTERVAL:
@@ -947,11 +1178,14 @@ class SmartFishFeederApp(QMainWindow):
             self.dosage_timer.timeout.connect(self.check_dosage_response)
 
             # Track today's feedings
-            self.today_feeding_count = 0
             self.today_date = datetime.datetime.now().date()
+            self.today_feeding_count = 0
 
             # UI setup
             self.setup_ui()
+
+            # Load today's feeding count from disk
+            self.load_today_feeding_count()
 
             # Initialize display buffers (add this line)
             self.initialize_display_buffers()
@@ -981,7 +1215,7 @@ class SmartFishFeederApp(QMainWindow):
             # Daily timer to reset feeding count
             self.daily_timer = QTimer()
             self.daily_timer.timeout.connect(self.check_day_change)
-            self.daily_timer.start(60000)  # Check every minute
+            self.daily_timer.start(2000)  # Check every minute
 
             # Add these new variables for time-based comparison
             self.feeding_response_history = deque(maxlen=20)  # Stores last 20 speed/variance readings during feeding
@@ -1004,6 +1238,8 @@ class SmartFishFeederApp(QMainWindow):
 
             self.initialisation_start_time = datetime.datetime.now()
             self.initialisation_complete = False
+            QTimer.singleShot(4 * 60 * 60 * 1000, self.restart_critical_components)
+            print("[MAINTENANCE] First component restart scheduled in 4 hours")
 
             # Initialize Prophet UI components
             self.setup_prophet_ui()
@@ -1018,9 +1254,6 @@ class SmartFishFeederApp(QMainWindow):
                 "cooldown": None
             }
 
-            # Start button state diagnostic timer
-            QTimer.singleShot(5000, self.check_button_state)
-
             # In SmartFishFeederApp.__init__ after creating both components:
             self.feeding_model.video_thread = self.video_thread
 
@@ -1034,7 +1267,7 @@ class SmartFishFeederApp(QMainWindow):
                                  "The application will continue with limited functionality.")
 
     def update_frame(self, frame, tracks, avg_speed, speed_variance):
-        """Update the displayed video frame with tracking info"""
+        """Update the displayed video frame with tracking info - with reduced data storage"""
         # Log data
         current_time = datetime.datetime.now()
         self.data_logger.log_data(current_time, avg_speed, speed_variance,
@@ -1044,40 +1277,26 @@ class SmartFishFeederApp(QMainWindow):
         self.speed_buffer.append(avg_speed)
         self.variance_buffer.append(speed_variance)
 
-        # Add data to appropriate mode arrays
-        if self.system_mode == "monitoring" or self.system_mode == "initialising":
-            # Add data to 5-minute window analysis
-            self.feeding_model.add_data_point(current_time, avg_speed, speed_variance)
-        elif self.system_mode == "pre_feeding":
+        # Only store in appropriate arrays if we're not just monitoring
+        # This avoids creating separate redundant arrays in monitoring mode
+        if self.system_mode == "pre_feeding":
             self.pre_feeding_speeds.append(avg_speed)
             self.pre_feeding_variances.append(speed_variance)
-            # Also track in feeding model with event type
+            # Track in feeding model with event type
             self.feeding_model.add_data_point(current_time, avg_speed, speed_variance, event_type="pre_feeding")
         elif self.system_mode == "feeding":
             self.during_feeding_speeds.append(avg_speed)
             self.during_feeding_variances.append(speed_variance)
-            # Also track in feeding model with event type
+            # Track in feeding model with event type
             self.feeding_model.add_data_point(current_time, avg_speed, speed_variance, event_type="during_feeding")
         elif self.system_mode == "post_feeding":
             self.post_feeding_speeds.append(avg_speed)
             self.post_feeding_variances.append(speed_variance)
-            # Also track in feeding model with event type
+            # Track in feeding model with event type
             self.feeding_model.add_data_point(current_time, avg_speed, speed_variance, event_type="post_feeding")
-            # Check if post-feeding mode is complete (30 seconds) and needs to be completed
-            if len(self.post_feeding_speeds) >= 30:
-                if not hasattr(self, 'post_feeding_timer_set'):
-                    # Set attribute to prevent multiple timers
-                    self.post_feeding_timer_set = True
-                    # Start a timer to complete the feeding cycle
-                    self.post_feeding_timer = QTimer()
-                    self.post_feeding_timer.setSingleShot(True)
-                    self.post_feeding_timer.timeout.connect(self.complete_feeding_cycle)
-                    self.post_feeding_timer.start(
-                        POST_FEEDING_DURATION * 1000 - 30000)  # Adjusted for the 30 seconds we already have
-                    print(f"[DEBUG] Post-feeding timer set to complete in {POST_FEEDING_DURATION - 30} seconds")
-
-
-
+        elif self.system_mode == "monitoring" or self.system_mode == "initialising":
+            # For monitoring, just add to the feeding model without creating separate arrays
+            self.feeding_model.add_data_point(current_time, avg_speed, speed_variance)
 
         # Draw bounding boxes and trajectories
         height, width, channel = frame.shape
@@ -1090,19 +1309,19 @@ class SmartFishFeederApp(QMainWindow):
         for track_id, box, trajectory, color in tracks:
             x1, y1, x2, y2 = box
             # Draw bounding box
-            cv2.rectangle(draw_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+            cv2.rectangle(draw_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 1)
 
             # Draw trajectory
             points = trajectory[-30:]
             if len(points) > 1:
                 for i in range(len(points) - 1):
-                    cv2.line(draw_frame, points[i], points[i + 1], color, 2)
+                    cv2.line(draw_frame, points[i], points[i + 1], color, 1)
             # Print first trajectory point coordinates
             if DEBUG_MODE:
                 if len(points) > 0:
                     print(f"First trajectory point: {points[0]}, Bounding box: {box}")
 
-        # Convert to QImage
+            # Convert to QImage
         q_img = QImage(draw_frame.data, width, height, bytes_per_line, QImage.Format_RGB888).rgbSwapped()
 
         # Create and set pixmap
@@ -1169,9 +1388,15 @@ class SmartFishFeederApp(QMainWindow):
             self.today_date = current_date
             self.today_feeding_count = 0
             self.update_feeding_count_display()
+            # Save the reset count
+            self.save_today_feeding_count()
 
     def update_feeding_count_display(self):
         """Update the feeding count display"""
+        if not hasattr(self, 'feeding_count_label'):
+            # Label doesn't exist yet, skip update
+            return
+
         self.feeding_count_label.setText(f"Today's feedings: {self.today_feeding_count}")
 
         # Add warning if approaching max daily feedings
@@ -1181,12 +1406,17 @@ class SmartFishFeederApp(QMainWindow):
             self.feeding_count_label.setStyleSheet("")
 
     @staticmethod
-    def excepthook(exc_type, exc_value, exc_tb):
+    def excepthook(self, exc_type, exc_value, exc_tb):
         """Global exception handler for PyQt slots"""
-        tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
-        print(f"UNHANDLED EXCEPTION:\n{tb}")
-        # Continue normal exception processing
-        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        try:
+            tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+            print(f"UNHANDLED EXCEPTION:\n{tb}")
+            # Continue normal exception processing
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+        except Exception as e:
+            print(f"Error in excepthook: {e}")
+            # Basic fallback if traceback formatting fails
+            print(f"Original exception: {exc_type.__name__}: {exc_value}")
 
     def setup_ui(self):
         # Main layout
@@ -1223,6 +1453,9 @@ class SmartFishFeederApp(QMainWindow):
         status_box = QGroupBox("System Status")
         status_layout = QVBoxLayout()
 
+        control_layout.setSpacing(5)  # Reduce padding between elements
+        control_layout.setContentsMargins(5, 5, 5, 5)  # Reduce margins
+
         # Dosage counter (only visible during feeding)
         self.dosage_display = QLabel("")
         self.dosage_display.setStyleSheet("font-size: 16px;")
@@ -1245,22 +1478,24 @@ class SmartFishFeederApp(QMainWindow):
 
         # Metrics display
         metrics_layout = QHBoxLayout()
+        metrics_layout.setSpacing(2)  # Minimal spacing
 
-        speed_box = QGroupBox("Current Speed")
-        speed_box_layout = QVBoxLayout()
+        speed_box = QWidget()
+        speed_layout = QHBoxLayout(speed_box)
+        speed_layout.setContentsMargins(2, 2, 2, 2)
+        speed_layout.addWidget(QLabel("Speed:"))
         self.speed_value = QLabel("0.00")
-        self.speed_value.setStyleSheet("font-size: 24px; font-weight: bold;")
-        self.speed_value.setAlignment(Qt.AlignCenter)
-        speed_box_layout.addWidget(self.speed_value)
-        speed_box.setLayout(speed_box_layout)
+        self.speed_value.setStyleSheet("font-size: 16px; font-weight: bold;")
+        speed_layout.addWidget(self.speed_value)
 
-        variance_box = QGroupBox("Current Variance")
-        variance_box_layout = QVBoxLayout()
+        # Create a compact variance display
+        variance_box = QWidget()
+        variance_layout = QHBoxLayout(variance_box)
+        variance_layout.setContentsMargins(2, 2, 2, 2)
+        variance_layout.addWidget(QLabel("Var:"))
         self.variance_value = QLabel("0.00")
-        self.variance_value.setStyleSheet("font-size: 24px; font-weight: bold;")
-        self.variance_value.setAlignment(Qt.AlignCenter)
-        variance_box_layout.addWidget(self.variance_value)
-        variance_box.setLayout(variance_box_layout)
+        self.variance_value.setStyleSheet("font-size: 16px; font-weight: bold;")
+        variance_layout.addWidget(self.variance_value)
 
         metrics_layout.addWidget(speed_box)
         metrics_layout.addWidget(variance_box)
@@ -1272,8 +1507,8 @@ class SmartFishFeederApp(QMainWindow):
         control_layout.addStretch()
 
         # Graphs
-        self.speed_graph = SpeedGraph(self, width=5, height=3)
-        self.variance_graph = VarianceGraph(self, width=5, height=3)
+        self.speed_graph = SpeedGraph(self)
+        self.variance_graph = VarianceGraph(self)
 
         # Feeding history
         history_box = QGroupBox("Feeding History")
@@ -1288,6 +1523,9 @@ class SmartFishFeederApp(QMainWindow):
         main_layout.addWidget(self.speed_graph, 1, 0, 1, 1)
         main_layout.addWidget(self.variance_graph, 1, 1, 1, 1)
         main_layout.addWidget(history_box, 1, 2, 1, 1)
+
+        main_layout.setRowStretch(0, 2)  # Give more space to video
+        main_layout.setRowStretch(1, 1)  # More space for graphs
 
         # Set column stretching
         main_layout.setColumnStretch(0, 2)
@@ -1314,37 +1552,51 @@ class SmartFishFeederApp(QMainWindow):
         self.status_update_timer.timeout.connect(self.update_status_display)
         self.status_update_timer.start(1000)  # Update every second
 
-        # Add these widgets to your layout
-        # For example, if you have a control_layout:
         control_layout.addWidget(status_box)
         control_layout.addWidget(self.feed_button)
         control_layout.addWidget(self.status_label)
 
     def update_display(self):
-        """Update the UI displays using just the data we need"""
+        """Update the UI displays with optimized data handling"""
         # Add post-feeding completion check
         current_time = datetime.datetime.now()
 
-        # Check if post-feeding mode should be completed
-        if (self.system_mode == "post_feeding" and
-                hasattr(self, 'post_feeding_end_time') and
-                current_time >= self.post_feeding_end_time and
-                not getattr(self, 'post_feeding_completion_triggered', False)):
-            print(f"[DISPLAY-CHECK] Post-feeding end time reached: {current_time} >= {self.post_feeding_end_time}")
-            self.post_feeding_completion_triggered = True  # Prevent multiple calls
+        # IMPORTANT: Add this to prevent too frequent updates
+        if hasattr(self, 'last_display_update_time'):
+            if time.time() - self.last_display_update_time < 3.0:  # Only update every 3 seconds
+                self.updating_graphs = False  # Clear flag immediately
+                return
+        self.last_display_update_time = time.time()
 
-            # Use a very short timer to complete after this update finishes
-            QTimer.singleShot(100, self.force_complete_feeding_cycle)
-            print("[DISPLAY-CHECK] Scheduled immediate completion")
+        self.updating_graphs = True  # Set flag to indicate graph updates are happening
 
-        # For live graphs, we only need the current monitoring window
-        timestamps, speeds, variances = self.video_thread.get_current_window_data()
+        # Reduce update frequency during initialization
+        if self.system_mode == "initialising":
+            if not hasattr(self, 'last_init_graph_update'):
+                self.last_init_graph_update = 0
 
-        # For feeding history display, use the significant stored events
-        feeding_events = self.video_thread.get_feeding_event_data("complete_feeding")
+            # During initialization, only update graphs every 5 seconds
+            if time.time() - self.last_init_graph_update < 5.0:  # 5 second minimum between updates
+                self.updating_graphs = False  # Clear flag immediately
+                return  # Skip this update entirely
+
+            self.last_init_graph_update = time.time()
+
         try:
-            # Get data from video thread
-            timestamps, speeds, variances = self.video_thread.get_speed_data()
+            # Check if post-feeding mode should be completed
+            if (self.system_mode == "post_feeding" and
+                    hasattr(self, 'post_feeding_end_time') and
+                    current_time >= self.post_feeding_end_time and
+                    not getattr(self, 'post_feeding_completion_triggered', False)):
+                print(f"[DISPLAY-CHECK] Post-feeding end time reached: {current_time} >= {self.post_feeding_end_time}")
+                self.post_feeding_completion_triggered = True  # Prevent multiple calls
+
+                # Use a very short timer to complete after this update finishes
+                QTimer.singleShot(100, self.force_complete_feeding_cycle)
+                print("[DISPLAY-CHECK] Scheduled immediate completion")
+
+            # For live graphs, get data from video thread with time window limitation
+            timestamps, speeds, variances = self.video_thread.get_speed_data(window_seconds=300)  # Last 5 minutes
 
             # Get satiated ranges from model
             speed_range, variance_range = self.feeding_model.get_satiated_ranges()
@@ -1364,18 +1616,24 @@ class SmartFishFeederApp(QMainWindow):
                     variance_range
                 )
 
-                # Mark missed feeding events on graphs with blue vertical lines
-                if hasattr(self.feeding_model, 'missed_feedings'):
-                    for missed in self.feeding_model.missed_feedings:
-                        # Convert timestamp to matplotlib format
-                        import matplotlib.dates
-                        event_time = matplotlib.dates.date2num(missed['timestamp'])
+                # Synchronize graph time windows
+                self.synchronize_graph_windows()
 
-                        # Add blue dotted line on both graphs
-                        if hasattr(self, 'speed_graph') and self.speed_graph.axes:
-                            self.speed_graph.axes.axvline(x=event_time, color='blue', linestyle='--', alpha=0.5)
-                        if hasattr(self, 'variance_graph') and self.variance_graph.axes:
-                            self.variance_graph.axes.axvline(x=event_time, color='blue', linestyle='--', alpha=0.5)
+                # Mark missed feeding events on graphs with blue vertical lines
+                missed_feedings = self.feeding_model.get_missed_feedings()
+                if missed_feedings:
+                    for missed in missed_feedings:
+                        # Only show missed feedings that are within our current view
+                        if timestamps and missed['timestamp'] >= timestamps[0]:
+                            # Convert timestamp to matplotlib format
+                            import matplotlib.dates
+                            event_time = matplotlib.dates.date2num(missed['timestamp'])
+
+                            # Add blue dotted line on both graphs
+                            if hasattr(self, 'speed_graph') and self.speed_graph.plot_widget:
+                                self.speed_graph.plot_widget.axvline(x=event_time, color='blue', linestyle='--', alpha=0.5)
+                            if hasattr(self, 'variance_graph') and self.variance_graph.axes:
+                                self.variance_graph.axes.axvline(x=event_time, color='blue', linestyle='--', alpha=0.5)
 
                     # Force redraw of graphs
                     if hasattr(self, 'speed_graph'):
@@ -1384,12 +1642,11 @@ class SmartFishFeederApp(QMainWindow):
                         self.variance_graph.fig.canvas.draw()
 
             # Update feeding history - include both regular and missed feedings
-            if hasattr(self.feeding_model, 'missed_feedings'):
-                # Get all feedings to display
-                all_feedings = self.feeding_model.feeding_history.copy()
-
+            all_feedings = self.feeding_model.get_feeding_history().copy()
+            missed_feedings = self.feeding_model.get_missed_feedings()
+            if missed_feedings:
                 # Add missed feedings with appropriate formatting
-                for missed in self.feeding_model.missed_feedings:
+                for missed in missed_feedings:
                     feed_record = {
                         'timestamp': missed['timestamp'],
                         'features': missed['features'],
@@ -1405,15 +1662,18 @@ class SmartFishFeederApp(QMainWindow):
                 self.feeding_history_table.update_history(all_feedings)
             else:
                 # Just update with regular feeding history
-                self.feeding_history_table.update_history(self.feeding_model.feeding_history)
+                self.feeding_history_table.update_history(self.feeding_model.get_feeding_history())
 
             # Check if new day started
             self.check_day_change()
 
         except Exception as e:
             print(f"Error in update_display: {e}")
-            import traceback
             traceback.print_exc()
+
+        finally:
+            # Clear flag when done - VERY IMPORTANT
+            self.updating_graphs = False
 
     def direct_post_feeding_check(self):
         """Direct method to check and enforce post-feeding completion"""
@@ -1444,61 +1704,27 @@ class SmartFishFeederApp(QMainWindow):
 
         return False  # No action needed
 
-    def analyze_hunger_patterns(self):
-        """Display hunger pattern analysis from missed and confirmed feedings"""
-        if not hasattr(self.feeding_model, 'hunger_patterns') or not self.feeding_model.hunger_patterns:
-            QMessageBox.information(self, "Hunger Pattern Analysis",
-                                    "Not enough data to analyze hunger patterns yet.")
-            return
-
-        patterns = self.feeding_model.hunger_patterns
-
-        # Find the most consistent patterns
-        pattern_scores = []
-
-        for hour, pattern in patterns.items():
-            if pattern['count'] < 3:
-                continue
-
-            # Calculate consistency score based on range vs average
-            speed_range = pattern['speed_range'][1] - pattern['speed_range'][0]
-            speed_avg = pattern['avg_speed']
-            var_range = pattern['variance_range'][1] - pattern['variance_range'][0]
-            var_avg = pattern['avg_variance']
-
-            # Lower score is better (more consistent)
-            score = (speed_range / speed_avg if speed_avg > 0 else 999) + \
-                    (var_range / var_avg if var_avg > 0 else 999)
-
-            pattern_scores.append((hour, pattern['count'], score, pattern))
-
-        # Sort by count (descending) then score (ascending)
-        pattern_scores.sort(key=lambda x: (-x[1], x[2]))
-
-        # Build message
-        if not pattern_scores:
-            QMessageBox.information(self, "Hunger Pattern Analysis",
-                                    "Not enough consistent data to analyze hunger patterns yet.")
-            return
-
-        message = "Hunger Pattern Analysis:\n\n"
-
-        for hour, count, score, pattern in pattern_scores[:5]:  # Show top 5
-            message += f"Hour {hour}:00 ({count} samples):\n"
-            message += f"  Avg Speed: {pattern['avg_speed']:.2f} BL/s\n"
-            message += f"  Speed Range: {pattern['speed_range'][0]:.2f}-{pattern['speed_range'][1]:.2f} BL/s\n"
-            message += f"  Consistency: {100 / (score if score > 0 else 999):.1f}%\n\n"
-
-        message += "These patterns will be used to improve hunger detection."
-
-        QMessageBox.information(self, "Hunger Pattern Analysis", message)
-
     def update_status_display(self):
-        # Near the beginning, add this check
+        """Update the status display with current mode, time, and dosage information"""
+        current_time = datetime.datetime.now()
+
+        # First, ensure cooldown state and mode are consistent
+        if self.cooldown_active and self.cooldown_end_time and current_time < self.cooldown_end_time:
+            if self.system_mode != "cooldown":
+                print(f"[DISPLAY] Correcting mode from {self.system_mode} to cooldown due to active cooldown")
+                self.system_mode = "cooldown"
+                if "monitoring" in self.mode_start_times and self.mode_start_times["monitoring"]:
+                    self.mode_start_times["cooldown"] = self.mode_start_times["monitoring"]
+
+            # Always update the status during cooldown (not just when it shows "FEEDING RECOMMENDED")
+            remaining_minutes = int((self.cooldown_end_time - current_time).total_seconds() / 60)
+            self.status_label.setText(f"Cooldown active. Next feeding available in {remaining_minutes} minutes")
+            self.status_label.setStyleSheet("")  # Reset style
+
+        # Make sure any "FEEDING RECOMMENDED" message is cleared during cooldown
         if self.cooldown_active and self.cooldown_end_time:
-            # Make sure any "FEEDING RECOMMENDED" message is cleared during cooldown
             if "FEEDING RECOMMENDED" in self.status_label.text():
-                remaining_minutes = int((self.cooldown_end_time - datetime.datetime.now()).total_seconds() / 60)
+                remaining_minutes = int((self.cooldown_end_time - current_time).total_seconds() / 60)
                 self.status_label.setText(f"Cooldown active. Next feeding available in {remaining_minutes} minutes")
                 self.status_label.setStyleSheet("")  # Reset style
 
@@ -1518,8 +1744,7 @@ class SmartFishFeederApp(QMainWindow):
                 # Show countdown
                 minutes = int(remaining // 60)
                 seconds = int(remaining % 60)
-                progress = int((elapsed_time / MONITORING_WINDOW) * 100)
-                self.time_label.setText(f"Initialising: {minutes:02d}:{seconds:02d} remaining ({progress}%)")
+                self.time_label.setText(f"Initialising: {minutes:02d}:{seconds:02d} remaining")
                 self.status_label.setText("System initialisation in progress. Please wait...")
             else:
                 # initialisation complete - transition to monitoring
@@ -1568,7 +1793,7 @@ class SmartFishFeederApp(QMainWindow):
             rem_min = int(remaining // 60)
             rem_sec = int(remaining % 60)
             self.time_label.setText(
-                f"Pre-feeding: {minutes:02d}:{seconds:02d} (Remaining: {rem_min:02d}:{rem_sec:02d})")
+                f"Pre-feeding: {rem_min:02d}:{rem_sec:02d}) remaining")
 
         elif self.system_mode == "feeding":
             self.mode_label.setText("Mode: ACTIVE FEEDING")
@@ -1603,7 +1828,7 @@ class SmartFishFeederApp(QMainWindow):
             rem_sec = int(remaining % 60)
 
             # Display as countdown
-            self.time_label.setText(f"Post-feeding: Remaining: {rem_min:02d}:{rem_sec:02d}")
+            self.time_label.setText(f"Post-feeding: {rem_min:02d}:{rem_sec:02d} remaining")
 
         # Update dosage counter
         self.dosage_label.setText(f"Dosage: {self.dosage_count}")
@@ -1945,22 +2170,6 @@ class SmartFishFeederApp(QMainWindow):
         # Tag this as important data to keep
         self.video_thread.add_data_point(timestamp, speed, variance, "during_feeding")
 
-    def check_button_state(self):
-        """Diagnostic method to print button state"""
-        print(f"Button state: Enabled={self.feed_button.isEnabled()}, Text={self.feed_button.text()}")
-        print(f"Current mode: {self.system_mode}")
-
-        # Force button to be enabled if we're in during mode with no dosages
-        if self.system_mode == "feeding" and self.dosage_count == 0:
-            print("Forcing button to enabled state")
-            self.feed_button.setEnabled(True)
-            self.feed_button.setText("CONFIRM FEED")
-            self.feed_button.setStyleSheet(
-                "background-color: #FF4500; color: white; font-size: 18px; font-weight: bold;")
-
-        # Schedule next check
-        QTimer.singleShot(5000, self.check_button_state)  # Check again in 5 seconds
-
     def check_feeding_timeout(self):
         """Timeout handler that properly records missed feedings as valid hunger events and ensures persistence"""
         current_time = datetime.datetime.now()
@@ -2004,6 +2213,19 @@ class SmartFishFeederApp(QMainWindow):
             self.during_feeding_variances = []
             self.post_feeding_speeds = []
             self.post_feeding_variances = []
+
+            # Reset any cached data in the feeding model
+            if hasattr(self.feeding_model, '_cache'):
+                for key in self.feeding_model._cache:
+                    self.feeding_model._cache[key] = None
+
+            # Perform targeted garbage collection
+            import gc
+            gc.collect()
+
+            # Ensure matplotlib resources are released
+            if hasattr(self, 'speed_graph') and hasattr(self.speed_graph, 'fig'):
+                plt.close(self.speed_graph.plot_widget)
 
             # Reset feeding response data
             if hasattr(self, 'feeding_response_history'):
@@ -2082,6 +2304,9 @@ class SmartFishFeederApp(QMainWindow):
         # Increment today's feeding count
         self.today_feeding_count += 1
         self.update_feeding_count_display()
+
+        # Add this line to save the count:
+        self.save_today_feeding_count()
 
         # Clear any existing post-feeding data to ensure we start fresh
         self.post_feeding_speeds = []
@@ -2204,9 +2429,8 @@ class SmartFishFeederApp(QMainWindow):
                     manual=False
                 )
 
-            # Reset mode and clear data
-            self.system_mode = "monitoring"
-            self.mode_start_times["monitoring"] = current_time
+            self.system_mode = "cooldown"
+            self.mode_start_times["cooldown"] = current_time
 
             self.pre_feeding_speeds = []
             self.pre_feeding_variances = []
@@ -2274,6 +2498,16 @@ class SmartFishFeederApp(QMainWindow):
         """Periodically check if feeding should be suggested based on Prophet model"""
         current_time = datetime.datetime.now()
 
+        # Force cooldown mode if cooldown is active
+        if self.cooldown_active and self.cooldown_end_time and current_time < self.cooldown_end_time:
+            if self.system_mode != "cooldown":
+                print(f"[DECISION] Enforcing cooldown mode - was {self.system_mode}")
+                self.system_mode = "cooldown"
+                self.mode_label.setText("Mode: COOLDOWN")
+                self.mode_label.setStyleSheet("font-size: 16px; font-weight: bold; color: blue;")
+                remaining_minutes = int((self.cooldown_end_time - current_time).total_seconds() / 60)
+                self.status_label.setText(f"Cooldown active. Next feeding available in {remaining_minutes} minutes")
+
         # Check operating hours transitions
         currently_in_hours = self.is_within_operating_hours(current_time)
 
@@ -2307,34 +2541,48 @@ class SmartFishFeederApp(QMainWindow):
                 self.last_outside_hours_message = time.time()
             return
 
-        # Skip if feeding is already active
-        if self.system_mode != "monitoring":
+        # Skip if feeding is already active or in cooldown mode
+        if self.system_mode != "monitoring" and self.system_mode != "cooldown":
             return
 
-        # Skip if in cooldown period
+        # Handle cooldown period explicitly
         if self.cooldown_active:
             if current_time < self.cooldown_end_time:
                 remaining_minutes = (self.cooldown_end_time - current_time).total_seconds() / 60
                 self.status_label.setText(
                     f"Cooldown active. Next feeding available in {int(remaining_minutes)} minutes")
+                # Important: Make sure UI shows cooldown mode
+                if self.system_mode != "cooldown":
+                    self.system_mode = "cooldown"
+                    self.mode_label.setText("Mode: COOLDOWN")
+                    self.mode_label.setStyleSheet("font-size: 16px; font-weight: bold; color: blue;")
                 return
             else:
+                # Only here do we transition from cooldown to monitoring
+                print(f"[COOLDOWN] Cooldown period has ended at {current_time}")
                 self.cooldown_active = False
+                self.system_mode = "monitoring"
+                self.mode_start_times["monitoring"] = current_time
+                self.mode_label.setText("Mode: MONITORING")
+                self.mode_label.setStyleSheet("font-size: 16px; font-weight: bold; color: green;")
+                self.status_label.setText("Cooldown period complete. Resuming normal monitoring.")
 
-        # Check if feeding should be recommended using Prophet model
-        if self.feeding_model.should_feed(current_time):
-            # If Prophet recommends feeding, show indicator in UI
-            self.status_label.setText("FEEDING RECOMMENDED - Prophet model predicts fish hunger")
-            self.status_label.setStyleSheet("color: red; font-weight: bold;")
-
-            # Begin the feeding cycle
-            self.start_feeding_cycle(current_time)
-        else:
-            # Update next feeding prediction if no immediate feeding
-            self.update_next_feeding_prediction()
-
-        # If a feeding wasn't started, make sure the next check time is displayed correctly
+        # Now, only if we're actually in monitoring mode (not cooldown) and cooldown isn't active,
+        # check if feeding should be suggested
         if self.system_mode == "monitoring" and not self.cooldown_active:
+            # Check if feeding should be recommended using Prophet model
+            if self.feeding_model.should_feed(current_time):
+                # If Prophet recommends feeding, show indicator in UI
+                self.status_label.setText("FEEDING RECOMMENDED - Prophet model predicts fish hunger")
+                self.status_label.setStyleSheet("color: red; font-weight: bold;")
+
+                # Begin the feeding cycle
+                self.start_feeding_cycle(current_time)
+            else:
+                # Update next feeding prediction if no immediate feeding
+                self.update_next_feeding_prediction()
+
+            # If a feeding wasn't started, make sure the next check time is displayed correctly
             next_check_in = FEED_DECISION_INTERVAL  # Reset to full interval
             next_min = int(next_check_in // 60)
             next_sec = int(next_check_in % 60)
@@ -2385,8 +2633,16 @@ class SmartFishFeederApp(QMainWindow):
 
     def closeEvent(self, event):
         """Handle application close event"""
-        # Stop video thread
-        self.video_thread.stop()
+        # Check if video_thread exists before stopping it
+        if hasattr(self, 'video_thread') and self.video_thread is not None:
+            try:
+                self.video_thread.stop()
+                print("Video thread stopped successfully")
+            except Exception as e:
+                print(f"Error stopping video thread: {e}")
+        else:
+            print("No video thread to stop")
+
         event.accept()
 
     def initialize_display_buffers(self):
@@ -2400,11 +2656,19 @@ class SmartFishFeederApp(QMainWindow):
         """Persistent safety check that runs periodically to detect and fix stuck feeding modes"""
         current_time = datetime.datetime.now()
 
-        # Skip if we're in monitoring mode
-        if self.system_mode == "monitoring":
+        # Skip if we're in monitoring mode and not in cooldown
+        if self.system_mode == "monitoring" and not self.cooldown_active:
             return
 
-        if self.system_mode == "cooldown":
+        if self.cooldown_active:
+            # If cooldown is active but the mode isn't cooldown, fix it
+            if self.system_mode != "cooldown":
+                print(f"[SAFETY] Cooldown active but mode is {self.system_mode} - correcting to cooldown mode")
+                self.system_mode = "cooldown"
+                self.mode_start_times["cooldown"] = self.mode_start_times.get("monitoring", current_time)
+                self.mode_label.setText("Mode: COOLDOWN")
+                self.mode_label.setStyleSheet("font-size: 16px; font-weight: bold; color: blue;")
+
             # Check if cooldown period has ended
             if hasattr(self, 'cooldown_end_time') and current_time >= self.cooldown_end_time:
                 print(f"[SAFETY] Cooldown period complete - transitioning to monitoring")
@@ -2524,8 +2788,8 @@ class SmartFishFeederApp(QMainWindow):
 
         # Check if there's a recent feeding that should trigger cooldown
         recent_feeding = False
-        if hasattr(self.feeding_model, 'feeding_history') and self.feeding_model.feeding_history:
-            last_feed = self.feeding_model.feeding_history[-1]['timestamp']
+        if hasattr(self.feeding_model, 'feeding_history') and self.feeding_model.get_feeding_history():
+            last_feed = self.feeding_model.get_feeding_history()[-1]['timestamp']
             time_since_last_feed = (current_time - last_feed).total_seconds()
 
             if time_since_last_feed < MIN_FEED_INTERVAL:
@@ -2542,8 +2806,8 @@ class SmartFishFeederApp(QMainWindow):
         # Single check for feeding history
         has_history = False
         if hasattr(self.feeding_model, 'feeding_history'):
-            has_history = len(self.feeding_model.feeding_history) > 0
-            print(f"Feeding history found: {has_history} ({len(self.feeding_model.feeding_history)} records)")
+            has_history = len(self.feeding_model.get_feeding_history()) > 0
+            print(f"Feeding history found: {has_history} ({len(self.feeding_model.get_feeding_history())} records)")
         else:
             print("No feeding_history attribute found in model")
 
@@ -2554,7 +2818,7 @@ class SmartFishFeederApp(QMainWindow):
             QTimer.singleShot(2000, lambda: self.start_feeding_cycle(current_time))
         else:
             # Continue with normal operation using Prophet
-            print(f"Using existing feeding history with {len(self.feeding_model.feeding_history)} records")
+            print(f"Using existing feeding history with {len(self.feeding_model.get_feeding_history())} records")
 
             if self.feeding_model.should_feed(current_time):
                 self.status_label.setText("FEEDING RECOMMENDED")
@@ -2631,50 +2895,6 @@ class SmartFishFeederApp(QMainWindow):
         QTimer.singleShot(PRE_FEEDING_DURATION * 1000, self.start_active_feeding)
 
         print(f"Pre-feeding analysis will run for {PRE_FEEDING_DURATION} seconds")
-
-    def check_button_state(self):
-        """Diagnostic method to monitor and fix button state"""
-        current_time = datetime.datetime.now()
-        print(f"\n----- Button State Check ({current_time}) -----")
-        print(f"Button state: Enabled={self.feed_button.isEnabled()}, Text={self.feed_button.text()}")
-        print(f"Current mode: {self.system_mode}")
-        print(f"Status text: {self.status_label.text()}")
-
-        # First, ensure button is disabled during cooldown regardless of other conditions
-        if self.system_mode == "cooldown" or self.cooldown_active:
-            if self.feed_button.isEnabled():
-                print("FIXING: Disabling feed button during cooldown period")
-                self.feed_button.setEnabled(False)
-                self.feed_button.setText("COOLDOWN")
-                self.feed_button.setStyleSheet(
-                    "background-color: #808080; color: white; font-size: 18px; font-weight: bold;")
-            return  # Exit early to prevent other conditions from enabling the button
-
-        # Fix common state issues:
-
-        # Case 1: We're in "feeding" mode but button is disabled or incorrectly connected
-        if self.system_mode == "feeding" and self.dosage_count == 0:
-            if not self.feed_button.isEnabled():
-                print("FIXING: Enabling button in during mode with no dosages")
-                self.feed_button.setEnabled(True)
-                self.feed_button.setText("CONFIRM FEED")
-                self.feed_button.setStyleSheet(
-                    "background-color: #FF4500; color: white; font-size: 18px; font-weight: bold;")
-                # Fix connection
-                self.fix_button_connections()
-
-        # Case 2: Feeding is recommended but button is disabled
-        if "FEEDING RECOMMENDED" in self.status_label.text() and not self.feed_button.isEnabled():
-            print("FIXING: Enabling button for feeding recommendation")
-            self.feed_button.setEnabled(True)
-            self.feed_button.setText("CONFIRM FEED")
-            self.feed_button.setStyleSheet(
-                "background-color: #FF4500; color: white; font-size: 18px; font-weight: bold;")
-            # Fix connection
-            self.fix_button_connections()
-
-        # Schedule next check
-        QTimer.singleShot(2000, self.check_button_state)  # Check more frequently (every 2 seconds)
 
     def setup_prophet_ui(self):
         """Add Prophet-specific UI components to the available space in the control panel"""
@@ -2788,7 +3008,6 @@ class SmartFishFeederApp(QMainWindow):
                 return
 
             # Create a compact figure
-            from matplotlib.figure import Figure
             fig = Figure(figsize=(4, 2.5), dpi=80)  # Smaller figure
             ax = fig.add_subplot(111)
 
@@ -2841,7 +3060,6 @@ class SmartFishFeederApp(QMainWindow):
                 self.forecast_canvas.deleteLater()
 
             # Create new canvas with the figure
-            from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
             self.forecast_canvas = FigureCanvasQTAgg(fig)
             self.forecast_canvas_widget.layout().addWidget(self.forecast_canvas)
 
@@ -2918,12 +3136,12 @@ class SmartFishFeederApp(QMainWindow):
             self.status_label.setText("Monitoring fish behavior. No immediate feeding needed.")
 
     def create_prophet_dashboard(self):
-        """Create a standalone dashboard window for Prophet model visualizations"""
+        """Create a standalone dashboard window for Prophet model visualizations with improved layout"""
         try:
             # Create a new window
             self.prophet_dashboard = QMainWindow()
             self.prophet_dashboard.setWindowTitle("Fish Feeding Prophet Dashboard")
-            self.prophet_dashboard.setGeometry(200, 200, 800, 600)
+            self.prophet_dashboard.setGeometry(200, 200, 900, 650)  # Larger window size
 
             # Create central widget and layout
             central_widget = QWidget()
@@ -2936,15 +3154,17 @@ class SmartFishFeederApp(QMainWindow):
             header_label.setStyleSheet("font-size: 18px; font-weight: bold;")
             main_layout.addWidget(header_label)
 
-            # Add forecast graph
+            # Add forecast graph - MAKE LARGER
             forecast_box = QGroupBox("24-Hour Hunger Forecast")
             forecast_layout = QVBoxLayout()
 
-            # Create matplotlib canvas
-            from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+            # Create matplotlib canvas with larger figure
             fig = self.feeding_model.get_forecast_plot()
             if fig:
+                # Adjust figure size
+                fig.set_size_inches(10, 5)  # Larger figure
                 canvas = FigureCanvasQTAgg(fig)
+                canvas.setMinimumHeight(250)  # Force minimum height
                 forecast_layout.addWidget(canvas)
             else:
                 canvas_placeholder = QLabel("Forecast not available - need more feeding data")
@@ -2953,13 +3173,22 @@ class SmartFishFeederApp(QMainWindow):
             forecast_box.setLayout(forecast_layout)
             main_layout.addWidget(forecast_box)
 
-            # Add hourly predictions table
+            # Add hourly predictions table with better spacing
             hourly_box = QGroupBox("Hourly Feeding Recommendations")
             hourly_layout = QVBoxLayout()
 
             hourly_table = QTableWidget()
             hourly_table.setColumnCount(4)
             hourly_table.setHorizontalHeaderLabels(["Time", "Hunger Score", "Uncertainty", "Recommendation"])
+
+            # Set column widths explicitly
+            hourly_table.setColumnWidth(0, 100)  # Time
+            hourly_table.setColumnWidth(1, 120)  # Hunger Score
+            hourly_table.setColumnWidth(2, 120)  # Uncertainty
+            hourly_table.setColumnWidth(3, 150)  # Recommendation
+
+            # Set minimum height to show more rows
+            hourly_table.setMinimumHeight(200)
 
             # Get predictions for next 24 hours
             forecast_data = self.feeding_model.get_daily_forecast()
@@ -2975,9 +3204,11 @@ class SmartFishFeederApp(QMainWindow):
                     score_item = QTableWidgetItem(f"{hour_data['hunger_score']:.2f}")
                     hourly_table.setItem(i, 1, score_item)
 
-                    # Uncertainty
+                    # Add debug print to see raw values
                     uncertainty = hour_data['upper_bound'] - hour_data['lower_bound']
-                    uncertainty_item = QTableWidgetItem(f"{uncertainty:.2f}")
+                    print(
+                        f"Hour: {hour_data['time'].hour}:00, Upper: {hour_data['upper_bound']:.6f}, Lower: {hour_data['lower_bound']:.6f}, Diff: {uncertainty:.6f}")
+                    uncertainty_item = QTableWidgetItem(f"{uncertainty:.2f}")  # Show 4 decimal places instead of 2
                     hourly_table.setItem(i, 2, uncertainty_item)
 
                     # Recommendation
@@ -2996,40 +3227,44 @@ class SmartFishFeederApp(QMainWindow):
             hourly_box.setLayout(hourly_layout)
             main_layout.addWidget(hourly_box)
 
-            # Add feeding history impact
+            # Add feeding history impact - Improved formatting
             history_box = QGroupBox("Feeding History Impact")
             history_layout = QVBoxLayout()
 
-            # Create text summary
+            # Create text summary with better formatting
             if self.feeding_model.trained and self.feeding_model.prophet_model:
                 history_text = QLabel(
-                    f"Prophet model trained with {len(self.feeding_model.feeding_history)} feeding events\n"
-                    f"and {len(self.feeding_model.missed_feedings)} missed feedings.\n\n"
-                    f"The model has identified daily patterns in fish hunger, with peak hunger typically\n"
-                    f"occurring at specific times of day based on your feeding history."
+                    f"<p><b>Prophet model trained with {len(self.feeding_model.get_feeding_history())} feeding events "
+                    f"and {len(self.feeding_model.get_missed_feedings())} missed feedings.</b></p>"
+                    f"<p>The model has identified daily patterns in fish hunger, with peak hunger typically "
+                    f"occurring at specific times of day based on your feeding history.</p>"
                 )
+                history_text.setWordWrap(True)
             else:
                 history_text = QLabel(
-                    "Not enough feeding history to analyze patterns yet.\n"
-                    "Continue using the system to accumulate more data."
+                    "<p>Not enough feeding history to analyze patterns yet.</p>"
+                    "<p>Continue using the system to accumulate more data.</p>"
                 )
+                history_text.setWordWrap(True)
 
             history_layout.addWidget(history_text)
             history_box.setLayout(history_layout)
             main_layout.addWidget(history_box)
 
-            # Add explanation
+            # Add explanation with better formatting
             explanation = QLabel(
-                "The Prophet model analyzes your feeding history to predict when fish are likely to be hungry.\n"
-                "Green areas show predicted times of satiation, while red areas indicate likely hunger periods.\n"
-                "The system will automatically recommend feedings based on these predictions and current behavior."
+                "<p>The Prophet model analyzes your feeding history to predict when fish are likely to be hungry.<br>"
+                "Green areas show predicted times of satiation, while red areas indicate likely hunger periods.<br>"
+                "The system will automatically recommend feedings based on these predictions and current behavior.</p>"
             )
+            explanation.setWordWrap(True)
             explanation.setStyleSheet("font-style: italic;")
             main_layout.addWidget(explanation)
 
             # Add refresh button
             refresh_button = QPushButton("Refresh Data")
             refresh_button.clicked.connect(lambda: self.update_prophet_dashboard())
+            refresh_button.setMinimumHeight(30)  # Taller button
             main_layout.addWidget(refresh_button)
 
             # Show the dashboard
@@ -3051,6 +3286,274 @@ class SmartFishFeederApp(QMainWindow):
             self.create_prophet_dashboard()
         except Exception as e:
             print(f"Error updating Prophet dashboard: {e}")
+
+    def monitor_resources(self):
+        """Monitor system resources and take action if necessary"""
+        try:
+            import psutil
+            import gc
+
+            # Get memory usage
+            process = psutil.Process(os.getpid())
+            memory_usage_mb = process.memory_info().rss / (1024 * 1024)
+
+            # Log memory usage every 10 minutes
+            current_time = datetime.datetime.now()
+            if not hasattr(self, 'last_memory_log') or (current_time - self.last_memory_log).total_seconds() > 600:
+                self.last_memory_log = current_time
+                print(f"[MEMORY] Current usage: {memory_usage_mb:.1f} MB at {current_time}")
+
+            # Take action if memory usage is too high
+            if memory_usage_mb > 500:  # 500MB threshold
+                print(f"[WARNING] High memory usage detected: {memory_usage_mb:.1f} MB")
+                # Force garbage collection
+                gc.collect()
+
+                # Clear matplotlib cache
+                plt.close('all')
+
+            return memory_usage_mb
+        except ImportError:
+            print("psutil package not available for memory monitoring")
+            return 0
+        except Exception as e:
+            print(f"Error in resource monitoring: {e}")
+            return 0
+
+    def setup_resource_monitoring(self):
+        self.resource_timer = QTimer()
+        self.resource_timer.timeout.connect(self.monitor_resources)
+        self.resource_timer.start(60000)  # Check every minute
+
+    def restart_critical_components(self):
+        """Restart critical components to prevent resource bloat"""
+        print(f"[MAINTENANCE] Performing scheduled component restart at {datetime.datetime.now()}")
+
+        # Only restart if in monitoring mode to avoid disrupting feeding
+        if self.system_mode != "monitoring":
+            print("[MAINTENANCE] Skipping restart - system not in monitoring mode")
+            return
+
+        try:
+            # 1. Stop and restart display timer
+            if hasattr(self, 'display_timer') and self.display_timer.isActive():
+                self.display_timer.stop()
+                self.display_timer.start(1000)
+                print("[MAINTENANCE] Display timer restarted")
+
+            # 2. Instead of clearing matplotlib figures completely, just refresh them with existing data
+            # Get the data
+            timestamps, speeds, variances = self.video_thread.get_speed_data(window_seconds=300)  # Last 5 minutes
+            speed_range, variance_range = self.feeding_model.get_satiated_ranges()
+
+            # Only refresh if we have enough data
+            if len(timestamps) >= 2 and len(speeds) >= 2 and len(variances) >= 2:
+                # Update graphs with current data
+                self.speed_graph.update_plot(
+                    timestamps.copy() if isinstance(timestamps, list) else list(timestamps),
+                    speeds.copy() if isinstance(speeds, list) else list(speeds),
+                    speed_range
+                )
+
+                self.variance_graph.update_plot(
+                    timestamps.copy() if isinstance(timestamps, list) else list(timestamps),
+                    variances.copy() if isinstance(variances, list) else list(variances),
+                    variance_range
+                )
+
+                # Synchronize graph time windows
+                self.synchronize_graph_windows()
+
+                print("[MAINTENANCE] Graphs refreshed with existing data")
+            else:
+                print("[MAINTENANCE] Not enough data to refresh graphs")
+
+            # 3. Force save feeding model to ensure data persistence
+            self.feeding_model.save_model()
+            print("[MAINTENANCE] Feeding model saved")
+
+            # 4. Force garbage collection
+            import gc
+            gc.collect()
+            print("[MAINTENANCE] Garbage collection performed")
+
+            # Schedule next restart in 4 hours
+            QTimer.singleShot(4 * 60 * 60 * 1000, self.restart_critical_components)
+            print("[MAINTENANCE] Next component restart scheduled in 4 hours")
+
+        except Exception as e:
+            print(f"[ERROR] Component restart failed: {e}")
+            traceback.print_exc()
+
+    def update_display(self):
+        """Update the UI displays with optimized data handling"""
+        # Add post-feeding completion check
+        current_time = datetime.datetime.now()
+
+        # IMPORTANT: Add this to prevent too frequent updates
+        if hasattr(self, 'last_display_update_time'):
+            if time.time() - self.last_display_update_time < 3.0:  # Only update every 3 seconds
+                self.updating_graphs = False  # Clear flag immediately
+                return
+        self.last_display_update_time = time.time()
+
+        self.updating_graphs = True  # Set flag to indicate graph updates are happening
+
+        try:
+            # For live graphs, get data from video thread with time window limitation
+            timestamps, speeds, variances = self.video_thread.get_speed_data(window_seconds=300)  # Last 5 minutes
+
+            # Get satiated ranges from model
+            speed_range, variance_range = self.feeding_model.get_satiated_ranges()
+
+            # Only update graphs if we have enough data
+            if len(timestamps) >= 2 and len(speeds) >= 2 and len(variances) >= 2:
+                # Update graphs with deep copies to avoid modifying original data
+                self.speed_graph.update_plot(
+                    timestamps.copy() if isinstance(timestamps, list) else list(timestamps),
+                    speeds.copy() if isinstance(speeds, list) else list(speeds),
+                    speed_range
+                )
+
+                self.variance_graph.update_plot(
+                    timestamps.copy() if isinstance(timestamps, list) else list(timestamps),
+                    variances.copy() if isinstance(variances, list) else list(variances),
+                    variance_range
+                )
+
+                # Synchronize graph time windows
+                self.synchronize_graph_windows()
+
+            # Update feeding history
+            all_feedings = self.feeding_model.get_feeding_history().copy()
+            missed_feedings = self.feeding_model.get_missed_feedings()
+            if missed_feedings:
+                # Add missed feedings with appropriate formatting
+                for missed in missed_feedings:
+                    feed_record = {
+                        'timestamp': missed['timestamp'],
+                        'features': missed['features'],
+                        'dosage_count': 0,
+                        'missed': True
+                    }
+                    all_feedings.append(feed_record)
+
+                # Sort by timestamp (most recent first)
+                all_feedings.sort(key=lambda x: x['timestamp'], reverse=True)
+
+                # Update the feeding history table with all feedings
+                self.feeding_history_table.update_history(all_feedings)
+            else:
+                # Just update with regular feeding history
+                self.feeding_history_table.update_history(self.feeding_model.get_feeding_history())
+
+            # Check if new day started
+            self.check_day_change()
+
+        except Exception as e:
+            print(f"Error in update_display: {e}")
+            traceback.print_exc()
+
+        finally:
+            # Clear flag when done - VERY IMPORTANT
+            self.updating_graphs = False
+
+    def excepthook(self, exc_type, exc_value, exc_tb):
+        """Global exception handler for PyQt slots"""
+        try:
+            tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+            print(f"UNHANDLED EXCEPTION:\n{tb}")
+            # Continue normal exception processing
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+        except Exception as e:
+            print(f"Error in excepthook: {e}")
+            # Basic fallback if traceback formatting fails
+            print(f"Original exception: {exc_type.__name__}: {exc_value}")
+
+    def initialize_mode_tracking(self):
+        """Initialize mode tracking variables"""
+        current_time = datetime.datetime.now()
+        self.mode_start_times = {
+            "initialising": current_time,
+            "monitoring": None,
+            "pre_feeding": None,
+            "feeding": None,
+            "post_feeding": None,
+            "cooldown": None
+        }
+        print("Mode tracking initialized")
+
+    def synchronize_graph_windows(self):
+        """Ensure both graphs show the same time window"""
+        try:
+            # Skip if either graph doesn't have data yet
+            if not hasattr(self.speed_graph, 'has_data') or not self.speed_graph.has_data or \
+                    not hasattr(self.variance_graph, 'has_data') or not self.variance_graph.has_data:
+                return
+
+            # Get current x ranges
+            speed_plot = self.speed_graph.plot_widget
+            variance_plot = self.variance_graph.plot_widget
+
+            speed_range = speed_plot.getViewBox().viewRange()[0]
+            variance_range = variance_plot.getViewBox().viewRange()[0]
+
+            # Calculate the union of both time ranges
+            min_x = min(speed_range[0], variance_range[0])
+            max_x = max(speed_range[1], variance_range[1])
+
+            # Set the same range for both graphs
+            speed_plot.setXRange(min_x, max_x, padding=0)
+            variance_plot.setXRange(min_x, max_x, padding=0)
+
+            if DEBUG_MODE:
+                print(f"Synchronized graph windows to x range: {min_x:.2f}-{max_x:.2f}")
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"Error synchronizing graph windows: {e}")
+
+    def load_today_feeding_count(self):
+        """Load today's feeding count from disk"""
+        try:
+            count_file = os.path.join(DATA_FOLDER, "daily_feeding_count.pkl")
+            if os.path.exists(count_file):
+                with open(count_file, 'rb') as f:
+                    data = pickle.load(f)
+                    saved_date = data.get('date')
+                    saved_count = data.get('count', 0)
+
+                    # Check if the saved date is today
+                    current_date = datetime.datetime.now().date()
+                    if saved_date == current_date:
+                        self.today_feeding_count = saved_count
+                        print(f"Loaded today's feeding count: {saved_count}")
+                    else:
+                        print(f"Saved feeding count is from {saved_date}, resetting for today ({current_date})")
+                        self.today_feeding_count = 0
+        except Exception as e:
+            print(f"Error loading daily feeding count: {e}")
+            self.today_feeding_count = 0
+
+        # Update the display
+        self.update_feeding_count_display()
+
+    def save_today_feeding_count(self):
+        """Save today's feeding count to disk"""
+        try:
+            count_file = os.path.join(DATA_FOLDER, "daily_feeding_count.pkl")
+            data = {
+                'date': self.today_date,
+                'count': self.today_feeding_count
+            }
+
+            with open(count_file, 'wb') as f:
+                pickle.dump(data, f)
+
+            print(f"Saved today's feeding count: {self.today_feeding_count}")
+        except Exception as e:
+            print(f"Error saving daily feeding count: {e}")
+
 
 # Main entry point
 if __name__ == "__main__":
